@@ -2,3 +2,4 @@ hdclone
 *.o
 *.hdc
 *.hdc.*
+*.o

@@ -78,9 +78,42 @@ static u64 le64(const u8 *p) { return (u64)le32(p) | ((u64)le32(p + 4) << 32); }
 static void put32(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
 static void put64(u8 *p, u64 v) { put32(p, (u32)v); put32(p + 4, (u32)(v >> 32)); }
 
+/* registro de recursos: permite liberar tudo se a operacao for abortada
+   (na interface grafica um erro encerra so a operacao, nao o programa) */
+#define RES_MEM 1
+#define RES_HANDLE 2
+#define MAX_RES 64
+static struct { int kind; void *p; } g_res[MAX_RES];
+static volatile int g_cancel;
+
+static void res_add(int kind, void *p)
+{
+    int i;
+    for (i = 0; i < MAX_RES; i++)
+        if (!g_res[i].p) { g_res[i].kind = kind; g_res[i].p = p; return; }
+}
+
+static void res_del(void *p)
+{
+    int i;
+    for (i = 0; i < MAX_RES; i++)
+        if (g_res[i].p == p) { g_res[i].p = NULL; return; }
+}
+
+#ifdef HDCLONE_GUI
+static void ui_log(const char *fmt, ...);
+static void ui_fatal(const char *msg);
+static void ui_progress(u64 done, u64 total, double speed, unsigned long eta);
+#define printf ui_log
+#endif
+
 static void die(const char *msg)
 {
+#ifdef HDCLONE_GUI
+    ui_fatal(msg); /* nao retorna */
+#else
     fprintf(stderr, "\nERRO: %s\n", msg);
+#endif
     exit(1);
 }
 
@@ -95,12 +128,14 @@ static void *xalloc(size_t n)
     else memset(p, 0, n);
 #endif
     if (!p) die("memoria insuficiente");
+    res_add(RES_MEM, p);
     return p;
 }
 
 static void xfree(void *p)
 {
     if (!p) return;
+    res_del(p);
 #ifdef _WIN32
     VirtualFree(p, 0, MEM_RELEASE);
 #else
@@ -185,6 +220,7 @@ static int dev_open(Dev *d, const char *spec, int write)
                        (write && !d->is_device) ? OPEN_ALWAYS : OPEN_EXISTING,
                        0, NULL);
     if (d->h == INVALID_HANDLE_VALUE) return -1;
+    res_add(RES_HANDLE, d->h);
     if (d->is_device) {
         DISK_GEOMETRY_EX gx;
         DISK_GEOMETRY g;
@@ -209,6 +245,7 @@ static int dev_open(Dev *d, const char *spec, int write)
     strncpy(d->name, spec, sizeof(d->name) - 1);
     d->fd = open(spec, write ? (O_RDWR | O_CREAT) : O_RDONLY, 0644);
     if (d->fd < 0) return -1;
+    res_add(RES_HANDLE, (void *)(intptr_t)(d->fd + 1));
     if (fstat(d->fd, &st) == 0) {
         if (S_ISBLK(st.st_mode)) {
             d->is_device = 1;
@@ -235,11 +272,12 @@ static void dev_close(Dev *d)
 #ifdef _WIN32
     if (d->h && d->h != INVALID_HANDLE_VALUE) {
         FlushFileBuffers(d->h);
+        res_del(d->h);
         CloseHandle(d->h);
     }
     d->h = NULL;
 #else
-    if (d->fd > 0) { fsync(d->fd); close(d->fd); }
+    if (d->fd > 0) { fsync(d->fd); res_del((void *)(intptr_t)(d->fd + 1)); close(d->fd); }
     d->fd = -1;
 #endif
 }
@@ -334,20 +372,24 @@ static int img_open_part(Img *m, int write)
 #ifdef _WIN32
     m->h = CreateFileA(nm, write ? GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ, NULL,
                        write ? CREATE_ALWAYS : OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    return m->h == INVALID_HANDLE_VALUE ? -1 : 0;
+    if (m->h == INVALID_HANDLE_VALUE) return -1;
+    res_add(RES_HANDLE, m->h);
+    return 0;
 #else
     m->fd = open(nm, write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY, 0644);
-    return m->fd < 0 ? -1 : 0;
+    if (m->fd < 0) return -1;
+    res_add(RES_HANDLE, (void *)(intptr_t)(m->fd + 1));
+    return 0;
 #endif
 }
 
 static void img_close_part(Img *m)
 {
 #ifdef _WIN32
-    if (m->h && m->h != INVALID_HANDLE_VALUE) CloseHandle(m->h);
+    if (m->h && m->h != INVALID_HANDLE_VALUE) { res_del(m->h); CloseHandle(m->h); }
     m->h = NULL;
 #else
-    if (m->fd > 0) close(m->fd);
+    if (m->fd > 0) { res_del((void *)(intptr_t)(m->fd + 1)); close(m->fd); }
     m->fd = -1;
 #endif
 }
@@ -520,6 +562,74 @@ static int system_disk(void)
     return path_disk(sys);
 }
 
+typedef struct {
+    int num;
+    u64 size;
+    u32 sector;
+    int is_system;
+    char model[128];
+    char letters[128];
+} DiskInfo;
+
+/* coleta informacoes do disco fisico n; retorna -1 se nao existe/inacessivel */
+static int disk_info(int n, int sysd, DiskInfo *di)
+{
+    char spec[16];
+    Dev d;
+    u8 buf[1024];
+    DWORD br;
+    STORAGE_PROPERTY_QUERY q;
+    char l;
+    memset(di, 0, sizeof(*di));
+    sprintf(spec, "%d", n);
+    if (dev_open(&d, spec, 0) != 0) return -1;
+    di->num = n;
+    di->size = d.size;
+    di->sector = d.sector;
+    di->is_system = (n == sysd);
+    memset(&q, 0, sizeof(q));
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType = PropertyStandardQuery;
+    if (DeviceIoControl(d.h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf, sizeof(buf), &br, NULL)) {
+        STORAGE_DEVICE_DESCRIPTOR *sd = (STORAGE_DEVICE_DESCRIPTOR *)buf;
+        if (sd->VendorIdOffset && sd->VendorIdOffset < br) {
+            strncat(di->model, (char *)buf + sd->VendorIdOffset, 40);
+            strcat(di->model, " ");
+        }
+        if (sd->ProductIdOffset && sd->ProductIdOffset < br)
+            strncat(di->model, (char *)buf + sd->ProductIdOffset, 60);
+    }
+    /* remove espacos extras */
+    {
+        char *p = di->model, *o = di->model;
+        int sp = 1;
+        for (; *p; p++) {
+            if (*p == ' ') { if (!sp) *o++ = ' '; sp = 1; }
+            else { *o++ = *p; sp = 0; }
+        }
+        if (o > di->model && o[-1] == ' ') o--;
+        *o = 0;
+    }
+    for (l = 'A'; l <= 'Z'; l++) {
+        char vp[8];
+        HANDLE h;
+        DWORD disk;
+        sprintf(vp, "\\\\.\\%c:", l);
+        h = CreateFileA(vp, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        if (volume_disk(h, &disk) == 0 && (int)disk == n) {
+            char t[4] = {l, ':', ' ', 0};
+            strcat(di->letters, t);
+        }
+        CloseHandle(h);
+    }
+    dev_close(&d);
+    return 0;
+}
+
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
 static void cmd_list(void)
 {
     int n, found = 0, sysd = system_disk();
@@ -527,46 +637,15 @@ static void cmd_list(void)
     printf("  No.  Tamanho      Modelo / Volumes\n");
     printf("  ---  -----------  ------------------------------------------\n");
     for (n = 0; n < 32; n++) {
-        char spec[16], sz[32], model[128] = "", letters[128] = "";
-        Dev d;
-        u8 buf[1024];
-        DWORD br;
-        STORAGE_PROPERTY_QUERY q;
-        char l;
-        sprintf(spec, "%d", n);
-        if (dev_open(&d, spec, 0) != 0) continue;
+        DiskInfo di;
+        char sz[32];
+        if (disk_info(n, sysd, &di) != 0) continue;
         found++;
-        memset(&q, 0, sizeof(q));
-        q.PropertyId = StorageDeviceProperty;
-        q.QueryType = PropertyStandardQuery;
-        if (DeviceIoControl(d.h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf, sizeof(buf), &br, NULL)) {
-            STORAGE_DEVICE_DESCRIPTOR *sd = (STORAGE_DEVICE_DESCRIPTOR *)buf;
-            if (sd->VendorIdOffset && sd->VendorIdOffset < br) {
-                strncat(model, (char *)buf + sd->VendorIdOffset, 40);
-                strcat(model, " ");
-            }
-            if (sd->ProductIdOffset && sd->ProductIdOffset < br)
-                strncat(model, (char *)buf + sd->ProductIdOffset, 60);
-        }
-        for (l = 'A'; l <= 'Z'; l++) {
-            char vp[8];
-            HANDLE h;
-            DWORD disk;
-            sprintf(vp, "\\\\.\\%c:", l);
-            h = CreateFileA(vp, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-            if (h == INVALID_HANDLE_VALUE) continue;
-            if (volume_disk(h, &disk) == 0 && (int)disk == n) {
-                char t[4] = {l, ':', ' ', 0};
-                strcat(letters, t);
-            }
-            CloseHandle(h);
-        }
-        fmt_size(d.size, sz);
-        printf("  %-3d  %-11s  %s\n", n, sz, model[0] ? model : "(desconhecido)");
+        fmt_size(di.size, sz);
+        printf("  %-3d  %-11s  %s\n", n, sz, di.model[0] ? di.model : "(desconhecido)");
         printf("                    volumes: %s%s  setor: %u bytes\n",
-               letters[0] ? letters : "(nenhum)", n == sysd ? " <- DISCO DO WINDOWS EM USO" : "",
-               d.sector);
-        dev_close(&d);
+               di.letters[0] ? di.letters : "(nenhum)", di.is_system ? " <- DISCO DO WINDOWS EM USO" : "",
+               di.sector);
     }
     if (!found)
         printf("  Nenhum disco acessivel. Execute como Administrador.\n");
@@ -597,6 +676,42 @@ typedef struct {
 #define MAX_AREAS 128
 static Area g_areas[MAX_AREAS];
 static int g_nareas;
+
+static void reset_areas(void)
+{
+    int i;
+    for (i = 0; i < g_nareas; i++) free(g_areas[i].bm);
+    g_nareas = 0;
+}
+
+#ifdef HDCLONE_GUI
+/* libera tudo o que ficou aberto (usado quando uma operacao e abortada) */
+static void unlock_all(void);
+static void cleanup_all(void)
+{
+    int i;
+    unlock_all();
+    for (i = 0; i < MAX_RES; i++) {
+        void *p = g_res[i].p;
+        if (!p) continue;
+        g_res[i].p = NULL;
+        if (g_res[i].kind == RES_MEM) {
+#ifdef _WIN32
+            VirtualFree(p, 0, MEM_RELEASE);
+#else
+            free(p);
+#endif
+        } else {
+#ifdef _WIN32
+            CloseHandle((HANDLE)p);
+#else
+            close((int)(intptr_t)p - 1);
+#endif
+        }
+    }
+    reset_areas();
+}
+#endif
 
 static int bm_get(const u8 *bm, u64 i) { return (bm[i >> 3] >> (i & 7)) & 1; }
 
@@ -872,6 +987,11 @@ static void progress(u64 done, u64 total, int force)
     pct = total ? 100.0 * (double)done / (double)total : 100.0;
     speed = ((double)done / 1048576.0) / ((double)el / 1000.0);
     eta = (speed > 0 && done < total) ? (unsigned long)(((double)(total - done) / 1048576.0) / speed) : 0;
+#ifdef HDCLONE_GUI
+    (void)pct;
+    ui_progress(done, total, speed, eta);
+    return;
+#endif
     printf("\r  %5.1f%%  %llu / %llu MB  %6.1f MB/s  restante %02lu:%02lu:%02lu ",
            pct, (unsigned long long)(done >> 20), (unsigned long long)(total >> 20), speed,
            eta / 3600, (eta / 60) % 60, eta % 60);
@@ -881,6 +1001,10 @@ static void progress(u64 done, u64 total, int force)
 static int confirm(const char *msg)
 {
     char line[64];
+#ifdef HDCLONE_GUI
+    (void)msg; (void)line;
+    return 1; /* a interface grafica ja confirmou antes de iniciar */
+#endif
     printf("%s\nDigite SIM para continuar: ", msg);
     fflush(stdout);
     if (!fgets(line, sizeof(line), stdin)) return 0;
@@ -921,6 +1045,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
 
     if (!o->raw) {
         printf("\nAnalisando particoes...\n");
+        reset_areas();
         scan_partitions(&d);
     } else {
         printf("\nModo setor a setor (--raw): todo o disco sera copiado\n");
@@ -963,6 +1088,8 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
         u64 p, q;
         u8 type;
         u32 stored = 0, crc = 0;
+
+        if (g_cancel) die("Operacao cancelada pelo usuario.");
 
         if (!o->raw && g_nareas) {
             for (p = off; p < off + len; p = q) {
@@ -1038,6 +1165,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     if (bad) printf("  ATENCAO: %llu setores ilegiveis foram preenchidos com zeros!\n", (unsigned long long)bad);
     xfree(buf);
     xfree(cbuf);
+    reset_areas();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1148,6 +1276,7 @@ static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m)
         u32 stored, crc;
         const u8 *data = NULL;
         char msg[128];
+        if (g_cancel) die("Operacao cancelada pelo usuario.");
         if (img_read(m, ch, 9) != 0) {
             sprintf(msg, "imagem incompleta: termina no bloco %llu de %llu (falta alguma parte?)",
                     (unsigned long long)i, (unsigned long long)h->nchunks);
@@ -1201,6 +1330,9 @@ static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m)
     xfree(zeros);
 }
 
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
 static void cmd_info(const char *path)
 {
     Img m;
@@ -1261,7 +1393,7 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
 
     if (!o->yes) {
         sprintf(msg, "\nATENCAO: TODO o conteudo de %s sera APAGADO e substituido pela imagem!", d.name);
-        if (!confirm(msg)) { printf("Cancelado.\n"); exit(1); }
+        if (!confirm(msg)) die("Cancelado.");
     }
 
     if (d.disknum >= 0) {
@@ -1305,6 +1437,7 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
 /* interface                                                           */
 /* ------------------------------------------------------------------ */
 
+#ifndef HDCLONE_GUI
 static void usage(void)
 {
     printf(
@@ -1414,3 +1547,4 @@ int main(int argc, char **argv)
     else { usage(); return 1; }
     return 0;
 }
+#endif /* HDCLONE_GUI */

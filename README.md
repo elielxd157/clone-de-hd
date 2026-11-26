@@ -13,7 +13,22 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
 - Restaurar num disco **maior** funciona (em GPT, a tabela é ajustada sozinha).
 
-## Uso (Prompt de Comando como Administrador)
+## Interface gráfica — `hdclone-gui.exe`
+
+Dê dois cliques no `hdclone-gui.exe` (ele pede permissão de Administrador sozinho).
+
+1. Escolha **Backup**, **Restaurar** ou **Verificar imagem**.
+2. Selecione o disco na lista (mostra tamanho, modelo, letras das unidades e qual é o
+   disco do Windows em uso).
+3. Escolha o arquivo de imagem em **Procurar...**.
+4. Clique em **Iniciar**. Barra de progresso, velocidade, tempo restante e um
+   registro detalhado aparecem na janela; dá para **Cancelar** a qualquer momento.
+
+Proteções: pede confirmação mostrando modelo/tamanho/unidades antes de apagar um
+disco, recusa restaurar sobre o disco do Windows em uso ou em disco menor que o
+original, e avisa ao copiar o disco do sistema ligado.
+
+## Linha de comando — `hdclone.exe` (Prompt de Comando como Administrador)
 
 ```
 hdclone list                          lista os discos (número, tamanho, modelo, letras)
@@ -43,4 +58,4 @@ Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0
 ## Compilar
 
 Em Linux (Debian/Ubuntu): `apt install gcc-mingw-w64-i686 libz-mingw-w64-dev`, depois
-`make` → `hdclone.exe`. `make linux` gera uma versão Linux (usada nos testes).
+`make` → `hdclone.exe` e `hdclone-gui.exe`. `make linux` gera uma versão Linux (usada nos testes).
