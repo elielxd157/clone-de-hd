@@ -1,0 +1,4 @@
+hdclone
+*.o
+*.hdc
+*.hdc.*
