@@ -13,6 +13,8 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - Compressão zlib em blocos de 1 MB com **CRC32 por bloco**.
 - Divide a imagem em partes de 4000 MB por padrão (cabe em pendrive FAT32).
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
+- **Recupera arquivos soltos** da imagem (sem restaurar o disco inteiro).
+- Deixa de fora `pagefile.sys` e `hiberfil.sys` (o Windows recria): imagem bem menor.
 - Restaura em disco **maior** ou **menor** que o original (em disco menor, a última
   partição é reduzida automaticamente quando os dados cabem).
 
@@ -46,6 +48,39 @@ snapshots são temporários e apagados ao terminar (ou ao cancelar).
 - Se o VSS falhar, o backup continua sem ele e o motivo aparece no log. Na
   interface, a mensagem final avisa quando o disco do Windows foi copiado sem VSS.
 - Para desligar: desmarque "Usar VSS" ou use `--no-vss`.
+
+## Recuperar arquivos da imagem
+
+Para pegar só alguns arquivos ou pastas (ex.: os Documentos de alguém) sem
+restaurar o disco:
+
+- **Interface:** escolha **Recuperar arquivos**, selecione a imagem e clique em
+  **Abrir imagem**. Abre uma janela parecida com o Windows Explorer: escolha a
+  partição, navegue nas pastas (dois cliques; Backspace volta), selecione os
+  itens (Ctrl/Shift para vários) e clique em **Extrair selecionados...**.
+- **Linha de comando:**
+  ```
+  hdclone ls pc.hdc                          lista as partições NTFS
+  hdclone ls pc.hdc 1 "Users\Ana"            lista uma pasta
+  hdclone extract pc.hdc 1 "Users\Ana\Documents" D:\recuperado
+  ```
+
+As datas de modificação são preservadas. Funciona com partições **NTFS**,
+inclusive arquivos grandes e fragmentados. Ficam de fora, com aviso:
+arquivos **comprimidos pelo NTFS** (pastas com "Compactar conteúdo"), arquivos
+**criptografados com EFS** e atalhos de pasta (*junctions*, como "Documents and
+Settings" no Vista+, que apontam para outro lugar).
+
+## pagefile.sys e hiberfil.sys
+
+Por padrão o backup **não copia** o conteúdo de `pagefile.sys`, `hiberfil.sys` e
+`swapfile.sys`. São arquivos temporários do Windows, recriados a cada boot, e
+costumam somar de 4 a 32 GB. Os arquivos continuam existindo no disco
+restaurado, com o mesmo tamanho; só o conteúdo antigo é descartado. O início
+de cada um é gravado como zeros, para o Windows não tentar "voltar da
+hibernação" (inclusive a Inicialização Rápida do Windows 8+) e fazer um boot
+normal. Para copiar mesmo assim: desmarque a opção na interface ou use
+`--keep-sys`.
 
 ## Restaurar em disco menor
 
@@ -99,7 +134,7 @@ Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
 Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
-`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--force`.
+`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--force`.
 
 ## Importante
 

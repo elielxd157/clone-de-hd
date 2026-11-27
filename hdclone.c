@@ -1124,9 +1124,11 @@ typedef struct {
 static Area g_areas[MAX_AREAS];
 static int g_nareas;
 
+static int g_nzr;
 static void reset_areas(void)
 {
     int i;
+    g_nzr = 0;
     for (i = 0; i < g_nareas; i++) free(g_areas[i].bm);
     g_nareas = 0;
 }
@@ -1212,11 +1214,11 @@ static int ntfs_geo(const u8 *b, u64 plen, NtfsGeo *g)
     return 0;
 }
 
-/* desfaz a protecao "update sequence" de um registro da MFT */
-static int ntfs_fixup(u8 *rec, u32 recsz)
+/* desfaz a protecao "update sequence" (registros FILE e blocos INDX) */
+static int ntfs_fixup_any(u8 *rec, u32 recsz)
 {
     u32 usa_off = le16(rec + 4), usa_cnt = le16(rec + 6), i;
-    if (memcmp(rec, "FILE", 4) != 0 || usa_off + 2 * usa_cnt > recsz) return -1;
+    if (usa_off + 2 * usa_cnt > recsz) return -1;
     for (i = 1; i < usa_cnt; i++) {
         u32 p = i * 512 - 2;
         if (p + 2 > recsz) break;
@@ -1239,6 +1241,12 @@ static void ntfs_protect(u8 *rec, u32 recsz)
         rec[p] = rec[usa_off];
         rec[p + 1] = rec[usa_off + 1];
     }
+}
+
+static int ntfs_fixup(u8 *rec, u32 recsz)
+{
+    if (memcmp(rec, "FILE", 4) != 0) return -1;
+    return ntfs_fixup_any(rec, recsz);
 }
 
 static int ntfs_read_rec(Dev *d, u64 off, const NtfsGeo *g, u32 n, u8 *rec)
@@ -1341,6 +1349,445 @@ fail:
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* leitor NTFS somente leitura (pastas e arquivos)                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    Run *r;
+    int n, cap;
+} RunList;
+
+typedef struct {
+    Dev *d;
+    u64 off;      /* inicio da particao no disco */
+    NtfsGeo g;
+    RunList mft;  /* runlist do $MFT */
+} Ntfs;
+
+typedef struct {
+    int resident;
+    u16 flags;    /* 0x0001 comprimido, 0x4000 criptografado, 0x8000 esparso */
+    u64 size, init_size;
+    u8 *res;      /* dados (atributo residente) */
+    u32 res_len;
+    RunList rl;
+} AttrData;
+
+static void rl_free(RunList *l)
+{
+    free(l->r);
+    memset(l, 0, sizeof(*l));
+}
+
+static int rl_append(RunList *l, const u8 *rec, u32 a)
+{
+    Run *tmp = malloc(sizeof(Run) * MAX_RUNS);
+    int n, i;
+    if (!tmp) return -1;
+    n = ntfs_runs(rec, a, tmp, MAX_RUNS);
+    if (n < 0) { free(tmp); return -1; }
+    if (l->n + n > l->cap) {
+        int nc = (l->n + n) * 2 + 16;
+        Run *r = realloc(l->r, sizeof(Run) * nc);
+        if (!r) { free(tmp); return -1; }
+        l->r = r;
+        l->cap = nc;
+    }
+    for (i = 0; i < n; i++) l->r[l->n++] = tmp[i];
+    free(tmp);
+    return 0;
+}
+
+static void ad_free(AttrData *ad)
+{
+    free(ad->res);
+    rl_free(&ad->rl);
+    memset(ad, 0, sizeof(*ad));
+}
+
+/* le bytes de um atributo nao residente (faixas esparsas viram zero) */
+static int nt_read_rl(Ntfs *nt, const RunList *l, u64 off, u64 len, u8 *out)
+{
+    u64 cs = nt->g.cs, vcn0 = 0;
+    int i = 0;
+    while (len) {
+        u64 vcn = off / cs, end, n;
+        while (i < l->n && vcn >= vcn0 + l->r[i].len) { vcn0 += l->r[i].len; i++; }
+        if (i >= l->n) { memset(out, 0, (size_t)len); return 0; }
+        end = (vcn0 + l->r[i].len) * cs;
+        n = end - off < len ? end - off : len;
+        if (l->r[i].lcn < 0) memset(out, 0, (size_t)n);
+        else if (dev_read_any(nt->d, nt->off + (u64)l->r[i].lcn * cs + (off - vcn0 * cs), n, out) != 0)
+            return -1;
+        out += n; off += n; len -= n;
+    }
+    return 0;
+}
+
+static int nt_rec(Ntfs *nt, u64 recno, u8 *buf)
+{
+    if (nt_read_rl(nt, &nt->mft, recno * nt->g.recsz, nt->g.recsz, buf) != 0) return -1;
+    if (ntfs_fixup(buf, nt->g.recsz) != 0) return -1;
+    return (le16(buf + 0x16) & 1) ? 0 : -1; /* registro em uso? */
+}
+
+/* nome do atributo confere? (name NULL = sem nome) */
+static int attr_name_eq(const u8 *nm, int nl, const char *name)
+{
+    int k;
+    if (!name) return nl == 0;
+    if (nl != (int)strlen(name)) return 0;
+    for (k = 0; k < nl; k++)
+        if (le16(nm + 2 * k) != (u8)name[k]) return 0;
+    return 1;
+}
+
+/* acha atributo num registro; svcn = VCN inicial exigido (ou -1 para qualquer) */
+static int nt_find(const u8 *rec, u32 recsz, u32 type, const char *name, i64 svcn)
+{
+    u32 a = le16(rec + 0x14);
+    while (a + 16 <= recsz) {
+        u32 t = le32(rec + a), alen = le32(rec + a + 4);
+        if (t == 0xFFFFFFFF || alen < 16 || a + alen > recsz) return -1;
+        if (t == type && a + le16(rec + a + 10) + 2u * rec[a + 9] <= recsz &&
+            attr_name_eq(rec + a + le16(rec + a + 10), rec[a + 9], name) &&
+            (svcn < 0 || rec[a + 8] == 0 || (i64)le64(rec + a + 0x10) == svcn))
+            return (int)a;
+        a += alen;
+    }
+    return -1;
+}
+
+static int ad_take(AttrData *ad, const u8 *rec, u32 a)
+{
+    if (rec[a + 8] == 0) {
+        u32 vlen = le32(rec + a + 0x10), voff = le16(rec + a + 0x14);
+        ad->resident = 1;
+        ad->res = malloc(vlen + 1);
+        if (!ad->res) return -1;
+        memcpy(ad->res, rec + a + voff, vlen);
+        ad->res_len = vlen;
+        ad->size = ad->init_size = vlen;
+        ad->flags = le16(rec + a + 0x0C);
+        return 0;
+    }
+    if (le64(rec + a + 0x10) == 0) { /* primeiro trecho: tamanhos validos */
+        ad->size = le64(rec + a + 0x30);
+        ad->init_size = le64(rec + a + 0x38);
+        ad->flags = le16(rec + a + 0x0C);
+    }
+    return rl_append(&ad->rl, rec, a);
+}
+
+/* reune um atributo completo, inclusive espalhado em varios registros
+   (lista de atributos, comum em arquivos grandes e fragmentados) */
+static int nt_get_attr(Ntfs *nt, u64 recno, u32 type, const char *name, AttrData *ad)
+{
+    u32 rs = nt->g.recsz;
+    u8 *base = malloc(rs), *ext = malloc(rs), *al = NULL;
+    u64 allen = 0, p;
+    int a, rc = -1, found = 0;
+    memset(ad, 0, sizeof(*ad));
+    if (!base || !ext || nt_rec(nt, recno, base) != 0) goto out;
+    a = nt_find(base, rs, 0x20, NULL, -1);
+    if (a < 0) {
+        a = nt_find(base, rs, type, name, -1);
+        if (a >= 0 && ad_take(ad, base, (u32)a) == 0) rc = 0;
+        goto out;
+    }
+    /* carrega a lista de atributos */
+    if (base[a + 8] == 0) {
+        allen = le32(base + a + 0x10);
+        al = malloc((size_t)allen + 1);
+        if (!al) goto out;
+        memcpy(al, base + a + le16(base + a + 0x14), (size_t)allen);
+    } else {
+        RunList l;
+        memset(&l, 0, sizeof(l));
+        allen = le64(base + a + 0x30);
+        if (allen > 16 * 1024 * 1024 || rl_append(&l, base, (u32)a) != 0) { rl_free(&l); goto out; }
+        al = malloc((size_t)allen + 1);
+        if (!al || nt_read_rl(nt, &l, 0, allen, al) != 0) { rl_free(&l); goto out; }
+        rl_free(&l);
+    }
+    for (p = 0; p + 0x1A <= allen;) {
+        u32 et = le32(al + p), el = le16(al + p + 4);
+        if (el < 0x1A || p + el > allen) break;
+        if (et == type && p + al[p + 7] + 2u * al[p + 6] <= allen &&
+            attr_name_eq(al + p + al[p + 7], al[p + 6], name)) {
+            u64 ref = le64(al + p + 0x10) & 0xFFFFFFFFFFFFull;
+            i64 svcn = (i64)le64(al + p + 8);
+            const u8 *r = base;
+            int b;
+            if (ref != recno) {
+                if (nt_rec(nt, ref, ext) != 0) goto out;
+                r = ext;
+            }
+            b = nt_find(r, rs, type, name, svcn);
+            if (b < 0 || ad_take(ad, r, (u32)b) != 0) goto out;
+            found = 1;
+            if (ad->resident) break;
+        }
+        p += el;
+    }
+    if (found) rc = 0;
+out:
+    if (rc != 0) ad_free(ad);
+    free(base);
+    free(ext);
+    free(al);
+    return rc;
+}
+
+/* le os dados de um atributo inteiro para a memoria (para atributos pequenos) */
+static u8 *nt_attr_bytes(Ntfs *nt, AttrData *ad, u64 *len)
+{
+    u8 *b;
+    *len = ad->size;
+    if (ad->resident) return ad->res;
+    if (ad->size > 64 * 1024 * 1024) return NULL;
+    b = malloc((size_t)ad->size + 1);
+    if (!b || nt_read_rl(nt, &ad->rl, 0, ad->size, b) != 0) { free(b); return NULL; }
+    free(ad->res);
+    ad->res = b;
+    return b;
+}
+
+static int nt_open(Ntfs *nt, Dev *d, u64 off, u64 plen)
+{
+    u8 b[512], *rec;
+    int a;
+    memset(nt, 0, sizeof(*nt));
+    nt->d = d;
+    nt->off = off;
+    if (dev_read_any(d, off, 512, b) != 0 || memcmp(b + 3, "NTFS    ", 8) != 0 || ntfs_geo(b, plen, &nt->g) != 0)
+        return -1;
+    rec = malloc(nt->g.recsz);
+    if (!rec || ntfs_read_rec(d, off, &nt->g, 0, rec) != 0 || (a = nt_find(rec, nt->g.recsz, 0x80, NULL, 0)) < 0 ||
+        rec[a + 8] == 0 || rl_append(&nt->mft, rec, (u32)a) != 0) {
+        free(rec);
+        rl_free(&nt->mft);
+        return -1;
+    }
+    if (nt_find(rec, nt->g.recsz, 0x20, NULL, -1) >= 0) { /* $MFT fragmentado em varios registros */
+        AttrData ad;
+        if (nt_get_attr(nt, 0, 0x80, NULL, &ad) == 0 && !ad.resident) {
+            rl_free(&nt->mft);
+            nt->mft = ad.rl;
+            ad.rl.r = NULL;
+        }
+        ad_free(&ad);
+    }
+    free(rec);
+    return 0;
+}
+
+static void nt_close(Ntfs *nt) { rl_free(&nt->mft); }
+
+/* ---- pastas ---- */
+
+typedef struct {
+    u64 rec;
+    u64 size;
+    u64 mtime;  /* FILETIME (100 ns desde 1601) */
+    u32 attr;
+    int is_dir;
+    int nlen;
+    u16 name[256];
+} DirEnt;
+
+typedef struct {
+    DirEnt *e;
+    int n, cap;
+} DirList;
+
+#define FA_REPARSE 0x400
+#define FA_DIR_IDX 0x10000000
+
+static void dl_free(DirList *dl)
+{
+    free(dl->e);
+    memset(dl, 0, sizeof(*dl));
+}
+
+static u16 fold16(u16 c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 0xE0 && c <= 0xFE && c != 0xF7)) return (u16)(c - 0x20);
+    return c;
+}
+
+static int name_cmp(const u16 *a, int na, const u16 *b, int nb)
+{
+    int i;
+    for (i = 0; i < na && i < nb; i++) {
+        u16 x = fold16(a[i]), y = fold16(b[i]);
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return na - nb;
+}
+
+static int name_eq_ascii(const DirEnt *e, const char *s)
+{
+    int i, n = (int)strlen(s);
+    if (e->nlen != n) return 0;
+    for (i = 0; i < n; i++)
+        if (fold16(e->name[i]) != fold16((u8)s[i])) return 0;
+    return 1;
+}
+
+static void dl_parse(DirList *dl, const u8 *buf, u64 len)
+{
+    u64 p = 0;
+    while (p + 16 <= len) {
+        u32 elen = le16(buf + p + 8), klen = le16(buf + p + 10), fl = le16(buf + p + 12);
+        const u8 *k = buf + p + 16;
+        if (elen < 16 || p + elen > len || (fl & 2)) break;
+        if (klen >= 0x42 && 16 + klen <= elen && k[0x41] != 2 && 0x42 + 2u * k[0x40] <= klen) {
+            DirEnt *d;
+            int i;
+            if (dl->n == dl->cap) {
+                int nc = dl->cap ? dl->cap * 2 : 64;
+                DirEnt *ne = realloc(dl->e, sizeof(DirEnt) * nc);
+                if (!ne) return;
+                dl->e = ne;
+                dl->cap = nc;
+            }
+            d = &dl->e[dl->n];
+            d->rec = le64(buf + p) & 0xFFFFFFFFFFFFull;
+            d->mtime = le64(k + 0x10);
+            d->size = le64(k + 0x30);
+            d->attr = le32(k + 0x38);
+            d->is_dir = (d->attr & FA_DIR_IDX) != 0;
+            d->nlen = k[0x40];
+            for (i = 0; i < d->nlen; i++) d->name[i] = le16(k + 0x42 + 2 * i);
+            dl->n++;
+        }
+        p += elen;
+    }
+}
+
+static int dirent_order(const void *x, const void *y)
+{
+    const DirEnt *a = x, *b = y;
+    if (a->is_dir != b->is_dir) return b->is_dir - a->is_dir;
+    return name_cmp(a->name, a->nlen, b->name, b->nlen);
+}
+
+/* lista uma pasta (registro da MFT); arquivos de sistema e "." ficam de fora */
+static int nt_list(Ntfs *nt, u64 recno, DirList *dl)
+{
+    AttrData root, alloc, bmp;
+    u8 *v, *buf = NULL, *bits = NULL;
+    u64 bitlen = 0, nb, i;
+    u32 ibs, eo, tot;
+    int j, k;
+    memset(dl, 0, sizeof(*dl));
+    if (nt_get_attr(nt, recno, 0x90, "$I30", &root) != 0 || !root.resident || root.res_len < 32) {
+        ad_free(&root);
+        return -1;
+    }
+    v = root.res;
+    ibs = le32(v + 8);
+    eo = le32(v + 16);
+    tot = le32(v + 20);
+    if (16 + tot <= root.res_len && eo < tot) dl_parse(dl, v + 16 + eo, tot - eo);
+    ad_free(&root);
+    if (ibs >= 512 && ibs <= 65536 && nt_get_attr(nt, recno, 0xA0, "$I30", &alloc) == 0) {
+        if (!alloc.resident) {
+            int have = nt_get_attr(nt, recno, 0xB0, "$I30", &bmp) == 0;
+            if (have) bits = nt_attr_bytes(nt, &bmp, &bitlen);
+            buf = malloc(ibs);
+            nb = alloc.size / ibs;
+            for (i = 0; buf && i < nb; i++) {
+                const u8 *ih;
+                if (bits && (i / 8 >= bitlen || !((bits[i / 8] >> (i & 7)) & 1))) continue;
+                if (nt_read_rl(nt, &alloc.rl, i * ibs, ibs, buf) != 0) continue;
+                if (memcmp(buf, "INDX", 4) != 0 || ntfs_fixup_any(buf, ibs) != 0) continue;
+                ih = buf + 0x18;
+                eo = le32(ih);
+                tot = le32(ih + 4);
+                if (0x18 + tot <= ibs && eo < tot) dl_parse(dl, ih + eo, tot - eo);
+            }
+            free(buf);
+            if (have) ad_free(&bmp);
+        }
+        ad_free(&alloc);
+    }
+    /* filtra metadados do NTFS ($MFT, $Bitmap...) e "." */
+    for (j = k = 0; j < dl->n; j++) {
+        DirEnt *e = &dl->e[j];
+        if (e->rec < 16 || (e->nlen == 1 && e->name[0] == '.')) continue;
+        dl->e[k++] = *e;
+    }
+    dl->n = k;
+    qsort(dl->e, dl->n, sizeof(DirEnt), dirent_order);
+    /* remove repetidos (mesmo registro e mesmo nome) */
+    for (j = k = 0; j < dl->n; j++) {
+        if (k && dl->e[k - 1].rec == dl->e[j].rec &&
+            name_cmp(dl->e[k - 1].name, dl->e[k - 1].nlen, dl->e[j].name, dl->e[j].nlen) == 0)
+            continue;
+        dl->e[k++] = dl->e[j];
+    }
+    dl->n = k;
+    return 0;
+}
+
+/* ---- pagefile.sys / hiberfil.sys / swapfile.sys ---- */
+
+/* faixas que devem ser gravadas como zero na imagem (inicio do hiberfil etc.) */
+#define MAX_ZR 64
+static struct { u64 off, len; } g_zr[MAX_ZR];
+static int g_keep_sys; /* --keep-sys: copiar esses arquivos mesmo assim */
+
+static void exclude_sysfiles(Dev *d, u64 off, u64 plen, u8 *bm, u64 ncl)
+{
+    static const char *names[] = {"pagefile.sys", "hiberfil.sys", "swapfile.sys"};
+    Ntfs nt;
+    DirList dl;
+    int i, k, r;
+    if (nt_open(&nt, d, off, plen) != 0) return;
+    if (nt_list(&nt, 5, &dl) != 0) { nt_close(&nt); return; }
+    for (i = 0; i < dl.n; i++) {
+        DirEnt *e = &dl.e[i];
+        AttrData ad;
+        u64 vcn = 0, freed = 0, keep = (4096 + nt.g.cs - 1) / nt.g.cs; /* 1a pagina: zerada */
+        char sz[32];
+        for (k = 0; k < 3 && !name_eq_ascii(e, names[k]); k++)
+            ;
+        if (k == 3 || e->is_dir) continue;
+        if (nt_get_attr(&nt, e->rec, 0x80, NULL, &ad) != 0) continue;
+        if (ad.resident) { ad_free(&ad); continue; }
+        for (r = 0; r < ad.rl.n; r++) {
+            Run *ru = &ad.rl.r[r];
+            u64 c;
+            for (c = 0; c < ru->len; c++, vcn++) {
+                u64 lcn;
+                if (ru->lcn < 0) continue;
+                lcn = (u64)ru->lcn + c;
+                if (lcn >= ncl) continue;
+                if (vcn < keep) {
+                    if (g_nzr < MAX_ZR) {
+                        g_zr[g_nzr].off = off + lcn * nt.g.cs;
+                        g_zr[g_nzr].len = nt.g.cs;
+                        g_nzr++;
+                    }
+                    continue;
+                }
+                if (bm[lcn >> 3] & (1 << (lcn & 7))) {
+                    bm[lcn >> 3] &= (u8)~(1 << (lcn & 7));
+                    freed++;
+                }
+            }
+        }
+        fmt_size(freed * nt.g.cs, sz);
+        printf("    %s: %s nao serao copiados (o Windows recria o arquivo)\n", names[k], sz);
+        ad_free(&ad);
+    }
+    dl_free(&dl);
+    nt_close(&nt);
+}
+
 static void map_ntfs(Dev *d, u64 off, u64 plen, const u8 *b)
 {
     NtfsGeo g;
@@ -1355,6 +1802,7 @@ static void map_ntfs(Dev *d, u64 off, u64 plen, const u8 *b)
     fmt_size(count_used(bm, g.ncl) * g.cs, s2);
     printf("  NTFS em %llu MB: %s, usado %s (cluster %u bytes)\n",
            (unsigned long long)(off >> 20), s1, s2, g.cs);
+    if (!g_keep_sys) exclude_sysfiles(d, off, plen, bm, g.ncl);
     add_area(off, g.cs, g.ncl, bm);
 }
 
@@ -1576,6 +2024,7 @@ typedef struct {
     int force;
     int zero_free;
     int no_vss;
+    int keep_sys;
 } Opts;
 
 static int g_vss_used; /* ultimo backup usou VSS */
@@ -1617,6 +2066,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
 
     if (!o->raw) {
         printf("\nAnalisando particoes...\n");
+        g_keep_sys = o->keep_sys;
         reset_areas();
         scan_partitions(&d);
     } else {
@@ -1656,7 +2106,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     for (i = 0; i < nchunks; i++) {
         u64 off = i * CHUNK_SIZE;
         u32 len = (u32)((d.size - off) < CHUNK_SIZE ? (d.size - off) : CHUNK_SIZE);
-        int any_free = 0, all_free = 1, f;
+        int any_free = 0, all_free = 1, f, k;
         u64 p, q;
         u8 type;
         u32 stored = 0, crc = 0;
@@ -1684,6 +2134,14 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
                         memset(buf + k, 0, d.sector);
                         bad++;
                     }
+                }
+            }
+            for (k = 0; k < g_nzr; k++) { /* inicio de hiberfil/pagefile: gravado como zero */
+                u64 zs = g_zr[k].off, ze = g_zr[k].off + g_zr[k].len;
+                if (ze > off && zs < off + len) {
+                    if (zs < off) zs = off;
+                    if (ze > off + len) ze = off + len;
+                    memset(buf + (zs - off), 0, (size_t)(ze - zs));
                 }
             }
             if (any_free) { /* zera os clusters livres para comprimir melhor */
@@ -1851,12 +2309,15 @@ typedef struct {
     u8 type;
 } ChunkIdx;
 
+#define IMG_CACHE 8 /* blocos descomprimidos em cache (MFT + dados alternam muito) */
+
 typedef struct {
     Img m;
     Hdr h;
     ChunkIdx *ix;
-    u8 *cache, *cbuf;
-    i64 ci;
+    u8 *cache[IMG_CACHE], *cbuf;
+    i64 ci[IMG_CACHE];
+    u64 used[IMG_CACHE], tick;
 } ImgSrc;
 
 static ImgSrc g_is;
@@ -1888,43 +2349,54 @@ static void imgsrc_open(const char *path)
         progress((i + 1) * CHUNK_SIZE < s->h.size ? (i + 1) * CHUNK_SIZE : s->h.size, s->h.size,
                  i + 1 == s->h.nchunks);
     }
-    s->cache = xalloc(CHUNK_SIZE);
+    for (i = 0; i < IMG_CACHE; i++) {
+        s->cache[i] = xalloc(CHUNK_SIZE);
+        s->ci[i] = -1;
+    }
     s->cbuf = xalloc(compressBound(CHUNK_SIZE));
-    s->ci = -1;
 }
 
 static void imgsrc_close(void)
 {
     ImgSrc *s = &g_is;
+    int i;
     img_close_part(&s->m);
     xfree(s->ix);
-    xfree(s->cache);
+    for (i = 0; i < IMG_CACHE; i++) xfree(s->cache[i]);
     xfree(s->cbuf);
     memset(s, 0, sizeof(*s));
 }
 
-static int imgsrc_chunk(ImgSrc *s, u64 i)
+/* devolve o bloco i descomprimido (cache LRU) ou NULL */
+static u8 *imgsrc_chunk(ImgSrc *s, u64 i)
 {
     ChunkIdx *c = &s->ix[i];
     u64 off = i * CHUNK_SIZE;
     u32 len = (u32)((s->h.size - off) < CHUNK_SIZE ? (s->h.size - off) : CHUNK_SIZE);
-    if (s->ci == (i64)i) return 0;
-    s->ci = -1;
+    int k, v = 0;
+    u8 *dst;
+    for (k = 0; k < IMG_CACHE; k++)
+        if (s->ci[k] == (i64)i) { s->used[k] = ++s->tick; return s->cache[k]; }
+    for (k = 1; k < IMG_CACHE; k++)
+        if (s->used[k] < s->used[v]) v = k;
+    dst = s->cache[v];
+    s->ci[v] = -1;
     if (c->type == CH_ZERO || c->type == CH_FREE) {
-        memset(s->cache, 0, len);
+        memset(dst, 0, len);
     } else {
-        if (img_seek(&s->m, c->part, c->pos) != 0) return -1;
+        if (img_seek(&s->m, c->part, c->pos) != 0) return NULL;
         if (c->type == CH_RAW) {
-            if (img_read(&s->m, s->cache, len) != 0) return -1;
+            if (img_read(&s->m, dst, len) != 0) return NULL;
         } else {
             uLongf ul = CHUNK_SIZE;
-            if (img_read(&s->m, s->cbuf, c->stored) != 0) return -1;
-            if (uncompress(s->cache, &ul, s->cbuf, c->stored) != Z_OK || ul != len) return -1;
+            if (img_read(&s->m, s->cbuf, c->stored) != 0) return NULL;
+            if (uncompress(dst, &ul, s->cbuf, c->stored) != Z_OK || ul != len) return NULL;
         }
-        if ((u32)crc32(0, s->cache, len) != c->crc) return -1;
+        if ((u32)crc32(0, dst, len) != c->crc) return NULL;
     }
-    s->ci = (i64)i;
-    return 0;
+    s->ci[v] = (i64)i;
+    s->used[v] = ++s->tick;
+    return dst;
 }
 
 static int imgsrc_pread(void *src, void *buf, u32 len, u64 off)
@@ -1935,8 +2407,9 @@ static int imgsrc_pread(void *src, void *buf, u32 len, u64 off)
         u64 i = off / CHUNK_SIZE;
         u32 o = (u32)(off % CHUNK_SIZE), n = CHUNK_SIZE - o;
         if (n > len) n = len;
-        if (off + n > s->h.size || imgsrc_chunk(s, i) != 0) return -1;
-        memcpy(p, s->cache + o, n);
+        u8 *c;
+        if (off + n > s->h.size || !(c = imgsrc_chunk(s, i))) return -1;
+        memcpy(p, c + o, n);
         p += n; off += n; len -= n;
     }
     return 0;
@@ -2381,6 +2854,449 @@ static void apply_shrink(Dev *d, Plan *pl)
     printf("  Tabela de particoes ajustada.\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* explorar a imagem: listar pastas e extrair arquivos (NTFS)          */
+/* ------------------------------------------------------------------ */
+
+#ifdef _WIN32
+typedef wchar_t xchar;
+#define XSEP L'\\'
+#else
+typedef char xchar;
+#define XSEP '/'
+#endif
+
+typedef struct {
+    u64 start, len;
+    char label[96];
+} VolInfo;
+
+static Dev g_vdev; /* disco virtual sobre g_is */
+
+static void open_virtual(const char *path)
+{
+    imgsrc_open(path);
+    memset(&g_vdev, 0, sizeof(g_vdev));
+    g_vdev.src = &g_is;
+    g_vdev.size = g_is.h.size;
+    g_vdev.sector = g_is.h.sector;
+    g_vdev.disknum = -1;
+    snprintf(g_vdev.name, sizeof(g_vdev.name), "%s", path);
+}
+
+/* UTF-16 -> texto para exibir (Windows: pagina de codigo do console; Linux: UTF-8) */
+static void u16_to_out(const u16 *w, int n, char *out, int size)
+{
+#ifdef _WIN32
+    int r = WideCharToMultiByte(CP_OEMCP, 0, (const WCHAR *)w, n, out, size - 1, NULL, NULL);
+    out[r > 0 ? r : 0] = 0;
+#else
+    int i, o = 0;
+    for (i = 0; i < n && o < size - 5; i++) {
+        u32 c = w[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < n && w[i + 1] >= 0xDC00 && w[i + 1] < 0xE000) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (w[i + 1] - 0xDC00);
+            i++;
+        }
+        if (c < 0x80) out[o++] = (char)c;
+        else if (c < 0x800) { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 63)); }
+        else if (c < 0x10000) {
+            out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 63));
+            out[o++] = (char)(0x80 | (c & 63));
+        } else {
+            out[o++] = (char)(0xF0 | (c >> 18)); out[o++] = (char)(0x80 | ((c >> 12) & 63));
+            out[o++] = (char)(0x80 | ((c >> 6) & 63)); out[o++] = (char)(0x80 | (c & 63));
+        }
+    }
+    out[o] = 0;
+#endif
+}
+
+/* texto digitado (Windows: ANSI; Linux: UTF-8) -> UTF-16 */
+static int in_to_u16(const char *s, u16 *w, int max)
+{
+#ifdef _WIN32
+    int r = MultiByteToWideChar(CP_ACP, 0, s, -1, (WCHAR *)w, max);
+    return r > 0 ? r - 1 : 0;
+#else
+    int n = 0;
+    const u8 *p = (const u8 *)s;
+    while (*p && n < max - 2) {
+        u32 c = *p++;
+        if (c >= 0xF0 && p[0] && p[1] && p[2]) { c = ((c & 7) << 18) | ((p[0] & 63) << 12) | ((p[1] & 63) << 6) | (p[2] & 63); p += 3; }
+        else if (c >= 0xE0 && p[0] && p[1]) { c = ((c & 15) << 12) | ((p[0] & 63) << 6) | (p[1] & 63); p += 2; }
+        else if (c >= 0xC0 && p[0]) { c = ((c & 31) << 6) | (p[0] & 63); p += 1; }
+        if (c >= 0x10000) { c -= 0x10000; w[n++] = (u16)(0xD800 + (c >> 10)); w[n++] = (u16)(0xDC00 + (c & 1023)); }
+        else w[n++] = (u16)c;
+    }
+    return n;
+#endif
+}
+
+/* lista as particoes NTFS da imagem */
+static int image_volumes(Dev *v, VolInfo *out, int max)
+{
+    PTable *t = malloc(sizeof(PTable));
+    int i, n = 0;
+    if (!t) return 0;
+    if (list_parts(v, t) != 0) { free(t); return 0; }
+    for (i = 0; i < t->n && n < max; i++) {
+        Ntfs nt;
+        AttrData ad;
+        if (nt_open(&nt, v, t->p[i].start, t->p[i].len) != 0) continue;
+        out[n].start = t->p[i].start;
+        out[n].len = t->p[i].len;
+        out[n].label[0] = 0;
+        if (nt_get_attr(&nt, 3, 0x60, NULL, &ad) == 0 && ad.resident) {
+            u16 w[64];
+            int k, nl = (int)(ad.res_len / 2 < 64 ? ad.res_len / 2 : 63);
+            for (k = 0; k < nl; k++) w[k] = le16(ad.res + 2 * k);
+            u16_to_out(w, nl, out[n].label, sizeof(out[n].label));
+        }
+        ad_free(&ad);
+        nt_close(&nt);
+        n++;
+    }
+    free(t);
+    return n;
+}
+
+/* resolve um caminho ("/" ou "\\" como separador) -> registro da MFT */
+static int nt_lookup(Ntfs *nt, const char *path, u64 *rec, int *is_dir)
+{
+    char comp[512];
+    const char *p = path;
+    *rec = 5;
+    *is_dir = 1;
+    for (;;) {
+        int n = 0, i, found = 0;
+        u16 w[512];
+        int wl;
+        DirList dl;
+        while (*p == '/' || *p == '\\') p++;
+        if (!*p) return 0;
+        while (*p && *p != '/' && *p != '\\' && n < 511) comp[n++] = *p++;
+        comp[n] = 0;
+        if (!*is_dir) return -1;
+        wl = in_to_u16(comp, w, 512);
+        if (nt_list(nt, *rec, &dl) != 0) return -1;
+        for (i = 0; i < dl.n; i++)
+            if (name_cmp(dl.e[i].name, dl.e[i].nlen, w, wl) == 0) {
+                *rec = dl.e[i].rec;
+                *is_dir = dl.e[i].is_dir;
+                found = 1;
+                break;
+            }
+        dl_free(&dl);
+        if (!found) return -1;
+    }
+}
+
+static void ft_to_str(u64 ft, char *out)
+{
+    time_t t;
+    struct tm *tm;
+    if (ft < 116444736000000000ull) { strcpy(out, "                "); return; }
+    t = (time_t)(ft / 10000000ull - 11644473600ull);
+    tm = localtime(&t);
+    if (tm) strftime(out, 20, "%d/%m/%Y %H:%M", tm);
+    else strcpy(out, "?");
+}
+
+/* ---- extracao ---- */
+
+typedef struct {
+    u64 files, dirs, bytes, total, skipped, errors;
+    int cancelled;
+} XStats;
+
+static XStats g_xs;
+
+static void xs_note(const char *what, const DirEnt *e)
+{
+    char nm[600];
+    u16_to_out(e->name, e->nlen, nm, sizeof(nm));
+    printf("  %s: %s\n", what, nm);
+}
+
+/* destino + separador + nome (caracteres invalidos no Windows viram "_") */
+static void x_join(xchar *out, int max, const xchar *dir, const DirEnt *e)
+{
+    int n = 0, i;
+#ifdef _WIN32
+    n = (int)wcslen(dir);
+    if (n > max - 2) n = max - 2;
+    memcpy(out, dir, n * sizeof(xchar));
+    if (n && out[n - 1] != XSEP && out[n - 1] != L'/') out[n++] = XSEP;
+    for (i = 0; i < e->nlen && n < max - 1; i++) {
+        wchar_t c = e->name[i];
+        if (c < 32 || wcschr(L"<>:\"/\\|?*", c)) c = L'_';
+        out[n++] = c;
+    }
+    out[n] = 0;
+#else
+    char nm[1100];
+    n = (int)strlen(dir);
+    if (n > max - 2) n = max - 2;
+    memcpy(out, dir, n);
+    if (n && out[n - 1] != XSEP) out[n++] = XSEP;
+    u16_to_out(e->name, e->nlen, nm, sizeof(nm));
+    for (i = 0; nm[i] && n < max - 1; i++) out[n++] = nm[i] == '/' ? '_' : nm[i];
+    out[n] = 0;
+#endif
+}
+
+#ifdef _WIN32
+/* caminhos longos: prefixo \\?\ (aceito pelas APIs "W" desde o XP) */
+static const wchar_t *x_long(const wchar_t *p, wchar_t *buf, int max)
+{
+    if (wcslen(p) < 240 || !p[0] || p[1] != L':') return p;
+    if ((int)wcslen(p) + 5 > max) return p;
+    wcscpy(buf, L"\\\\?\\");
+    wcscat(buf, p);
+    return buf;
+}
+#endif
+
+static int x_mkdir(const xchar *p)
+{
+#ifdef _WIN32
+    wchar_t b[1100];
+    const wchar_t *q = x_long(p, b, 1100);
+    return (CreateDirectoryW(q, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) ? 0 : -1;
+#else
+    return (mkdir(p, 0755) == 0 || errno == EEXIST) ? 0 : -1;
+#endif
+}
+
+/* copia um arquivo da imagem para o disco */
+static void nt_extract_file(Ntfs *nt, const DirEnt *e, const xchar *path)
+{
+    AttrData ad, si;
+    u64 off = 0, mtime = e->mtime;
+    u8 *buf = NULL;
+    int ok = 1;
+#ifdef _WIN32
+    wchar_t lb[1100];
+    HANDLE f;
+#else
+    FILE *f;
+#endif
+    if (nt_get_attr(nt, e->rec, 0x80, NULL, &ad) != 0) { xs_note("ERRO ao ler (ignorado)", e); g_xs.errors++; return; }
+    if (ad.flags & 0x0001) { xs_note("ignorado (comprimido pelo NTFS)", e); g_xs.skipped++; ad_free(&ad); return; }
+    if (ad.flags & 0x4000) { xs_note("ignorado (criptografado com EFS)", e); g_xs.skipped++; ad_free(&ad); return; }
+    if (nt_get_attr(nt, e->rec, 0x10, NULL, &si) == 0 && si.resident && si.res_len >= 16) mtime = le64(si.res + 8);
+    ad_free(&si);
+#ifdef _WIN32
+    f = CreateFileW(x_long(path, lb, 1100), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; ad_free(&ad); return; }
+#else
+    f = fopen(path, "wb");
+    if (!f) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; ad_free(&ad); return; }
+#endif
+    if (ad.resident) {
+#ifdef _WIN32
+        DWORD w;
+        ok = WriteFile(f, ad.res, ad.res_len, &w, NULL) && w == ad.res_len;
+#else
+        ok = fwrite(ad.res, 1, ad.res_len, f) == ad.res_len;
+#endif
+        g_xs.bytes += ad.res_len;
+    } else {
+        buf = malloc(CHUNK_SIZE);
+        if (!buf) ok = 0;
+        while (ok && off < ad.size) {
+            u64 n = ad.size - off < CHUNK_SIZE ? ad.size - off : CHUNK_SIZE;
+            if (g_cancel) { g_xs.cancelled = 1; ok = 0; break; }
+            if (off >= ad.init_size) memset(buf, 0, (size_t)n); /* alem do "inicializado" = zeros */
+            else {
+                u64 r = ad.init_size - off < n ? ad.init_size - off : n;
+                if (nt_read_rl(nt, &ad.rl, off, r, buf) != 0) { ok = 0; break; }
+                if (r < n) memset(buf + r, 0, (size_t)(n - r));
+            }
+#ifdef _WIN32
+            {
+                DWORD w;
+                if (!WriteFile(f, buf, (DWORD)n, &w, NULL) || w != n) { ok = 0; break; }
+            }
+#else
+            if (fwrite(buf, 1, (size_t)n, f) != n) { ok = 0; break; }
+#endif
+            off += n;
+            g_xs.bytes += n;
+            progress(g_xs.bytes < g_xs.total ? g_xs.bytes : g_xs.total, g_xs.total, 0);
+        }
+        free(buf);
+    }
+#ifdef _WIN32
+    if (mtime) {
+        FILETIME ft;
+        ft.dwLowDateTime = (DWORD)mtime;
+        ft.dwHighDateTime = (DWORD)(mtime >> 32);
+        SetFileTime(f, NULL, NULL, &ft);
+    }
+    CloseHandle(f);
+#else
+    fclose(f);
+    if (mtime > 116444736000000000ull) {
+        struct timeval tv[2];
+        tv[0].tv_sec = tv[1].tv_sec = (time_t)(mtime / 10000000ull - 11644473600ull);
+        tv[0].tv_usec = tv[1].tv_usec = 0;
+        utimes(path, tv);
+    }
+#endif
+    if (g_xs.cancelled) { ad_free(&ad); return; }
+    if (!ok) { xs_note("ERRO na copia (disco cheio ou imagem danificada)", e); g_xs.errors++; }
+    else g_xs.files++;
+    ad_free(&ad);
+}
+
+/* soma tamanhos (para a barra de progresso) */
+static void nt_du(Ntfs *nt, const DirEnt *e, int depth)
+{
+    DirList dl;
+    int i;
+    if (!e->is_dir) { g_xs.total += e->size; return; }
+    if (depth > 64 || (e->attr & FA_REPARSE) || nt_list(nt, e->rec, &dl) != 0) return;
+    for (i = 0; i < dl.n && !g_cancel; i++) nt_du(nt, &dl.e[i], depth + 1);
+    dl_free(&dl);
+}
+
+static void nt_extract_entry(Ntfs *nt, const DirEnt *e, const xchar *dest, int depth)
+{
+    xchar path[1100];
+    DirList dl;
+    int i;
+    if (g_cancel) { g_xs.cancelled = 1; return; }
+    if (e->attr & FA_REPARSE) { xs_note("ignorado (atalho de pasta/junction)", e); g_xs.skipped++; return; }
+    x_join(path, 1100, dest, e);
+    if (!e->is_dir) { nt_extract_file(nt, e, path); return; }
+    if (depth > 64 || x_mkdir(path) != 0) { xs_note("ERRO ao criar pasta", e); g_xs.errors++; return; }
+    g_xs.dirs++;
+    if (nt_list(nt, e->rec, &dl) != 0) { xs_note("ERRO ao ler pasta", e); g_xs.errors++; return; }
+    for (i = 0; i < dl.n && !g_xs.cancelled; i++) nt_extract_entry(nt, &dl.e[i], path, depth + 1);
+    dl_free(&dl);
+}
+
+/* extrai uma selecao de itens para a pasta dest */
+static void extract_entries(Ntfs *nt, const DirEnt *sel, int nsel, const xchar *dest)
+{
+    int i;
+    char s1[32];
+    memset(&g_xs, 0, sizeof(g_xs));
+    printf("Calculando tamanho...\n");
+    for (i = 0; i < nsel; i++) nt_du(nt, &sel[i], 0);
+    if (!g_xs.total) g_xs.total = 1;
+    fmt_size(g_xs.total, s1);
+    printf("Extraindo %s...\n", s1);
+    g_t0 = g_tlast = now_ms();
+    for (i = 0; i < nsel && !g_xs.cancelled; i++) nt_extract_entry(nt, &sel[i], dest, 0);
+    progress(g_xs.total, g_xs.total, 1);
+    fmt_size(g_xs.bytes, s1);
+    printf("\n%s: %llu arquivos, %llu pastas, %s", g_xs.cancelled ? "Cancelado" : "Concluido",
+           (unsigned long long)g_xs.files, (unsigned long long)g_xs.dirs, s1);
+    if (g_xs.skipped) printf(", %llu ignorados", (unsigned long long)g_xs.skipped);
+    if (g_xs.errors) printf(", %llu ERROS", (unsigned long long)g_xs.errors);
+    printf("\n");
+}
+
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
+static void cmd_ls(const char *img, const char *vol, const char *path)
+{
+    VolInfo v[32];
+    int nv, i, is_dir;
+    char sz[32];
+    printf("Abrindo a imagem...\n");
+    open_virtual(img);
+    printf("\n");
+    nv = image_volumes(&g_vdev, v, 32);
+    if (!vol) {
+        printf("Particoes NTFS na imagem:\n");
+        for (i = 0; i < nv; i++) {
+            fmt_size(v[i].len, sz);
+            printf("  %d  %-10s  rotulo: %-20s (inicio em %llu MB)\n", i + 1, sz, v[i].label[0] ? v[i].label : "-",
+                   (unsigned long long)(v[i].start >> 20));
+        }
+        if (!nv) printf("  (nenhuma)\n");
+        printf("\nUse: hdclone ls <imagem> <numero> [pasta]\n");
+    } else {
+        Ntfs nt;
+        u64 rec;
+        DirList dl;
+        int k = atoi(vol) - 1;
+        if (k < 0 || k >= nv) die("numero de particao invalido (veja 'hdclone ls <imagem>')");
+        if (nt_open(&nt, &g_vdev, v[k].start, v[k].len) != 0) die("nao foi possivel abrir o NTFS");
+        if (nt_lookup(&nt, path ? path : "", &rec, &is_dir) != 0 || !is_dir) die("pasta nao encontrada");
+        if (nt_list(&nt, rec, &dl) != 0) die("nao foi possivel ler a pasta");
+        for (i = 0; i < dl.n; i++) {
+            char nm[600], dt[24];
+            u16_to_out(dl.e[i].name, dl.e[i].nlen, nm, sizeof(nm));
+            ft_to_str(dl.e[i].mtime, dt);
+            if (dl.e[i].is_dir) printf("  %-16s  %12s  %s\\\n", dt, "<PASTA>", nm);
+            else printf("  %-16s  %12llu  %s\n", dt, (unsigned long long)dl.e[i].size, nm);
+        }
+        printf("  %d itens\n", dl.n);
+        dl_free(&dl);
+        nt_close(&nt);
+    }
+    imgsrc_close();
+}
+
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
+static void cmd_extract(const char *img, const char *vol, const char *path, const char *dest)
+{
+    VolInfo v[32];
+    int nv, k, is_dir;
+    Ntfs nt;
+    DirEnt e;
+    xchar xdest[1100];
+    const char *base;
+    printf("Abrindo a imagem...\n");
+    open_virtual(img);
+    printf("\n");
+    nv = image_volumes(&g_vdev, v, 32);
+    k = atoi(vol) - 1;
+    if (k < 0 || k >= nv) die("numero de particao invalido (veja 'hdclone ls <imagem>')");
+    if (nt_open(&nt, &g_vdev, v[k].start, v[k].len) != 0) die("nao foi possivel abrir o NTFS");
+    memset(&e, 0, sizeof(e));
+    if (nt_lookup(&nt, path, &e.rec, &is_dir) != 0) die("arquivo ou pasta nao encontrado na imagem");
+    e.is_dir = is_dir;
+    /* nome = ultimo componente do caminho (raiz: "particao") */
+    base = path + strlen(path);
+    while (base > path && (base[-1] == '/' || base[-1] == '\\')) base--;
+    {
+        const char *end = base;
+        while (base > path && base[-1] != '/' && base[-1] != '\\') base--;
+        if (end == base) e.nlen = in_to_u16("particao", e.name, 256);
+        else {
+            char tmp[512];
+            int l = (int)(end - base) < 511 ? (int)(end - base) : 511;
+            memcpy(tmp, base, l);
+            tmp[l] = 0;
+            e.nlen = in_to_u16(tmp, e.name, 256);
+        }
+    }
+    if (!is_dir) {
+        AttrData ad;
+        if (nt_get_attr(&nt, e.rec, 0x80, NULL, &ad) == 0) e.size = ad.size;
+        ad_free(&ad);
+    }
+#ifdef _WIN32
+    MultiByteToWideChar(CP_ACP, 0, dest, -1, xdest, 1100);
+#else
+    snprintf(xdest, sizeof(xdest), "%s", dest);
+#endif
+    if (x_mkdir(xdest) != 0) die("nao foi possivel criar a pasta de destino");
+    extract_entries(&nt, &e, 1, xdest);
+    nt_close(&nt);
+    imgsrc_close();
+    if (g_xs.errors) die("alguns arquivos nao puderam ser extraidos (veja acima)");
+}
+
 /* processa a imagem; se d != NULL grava no disco */
 static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m, u64 limit)
 {
@@ -2587,13 +3503,17 @@ static void usage(void)
         "  hdclone backup  <disco> <img.hdc>    cria imagem do disco\n"
         "  hdclone restore <img.hdc> <disco>    grava a imagem em um disco\n"
         "  hdclone verify  <img.hdc>            confere a integridade da imagem\n"
-        "  hdclone info    <img.hdc>            mostra informacoes da imagem\n\n"
+        "  hdclone info    <img.hdc>            mostra informacoes da imagem\n"
+        "  hdclone ls      <img.hdc> [N [pasta]]           lista particoes / pastas da imagem\n"
+        "  hdclone extract <img.hdc> N <caminho> <destino> copia arquivo/pasta da imagem\n\n"
         "<disco> = numero mostrado em 'list' (ex.: 1) ou caminho de arquivo/dispositivo.\n\n"
         "Opcoes de backup:\n"
         "  -c N         nivel de compressao 1 (rapido) a 9 (menor). Padrao: 6\n"
         "  -s MB        dividir a imagem em partes de MB megabytes. Padrao: 4000\n"
         "               (cabe em pendrive FAT32). Use -s 0 para arquivo unico.\n"
         "  --raw        copia setor a setor, inclusive espaco livre\n"
+        "  --keep-sys   copiar tambem pagefile.sys/hiberfil.sys/swapfile.sys (por padrao\n"
+        "               ficam de fora: o Windows recria esses arquivos)\n"
         "  --no-vss     nao usar VSS (copia de sombra). Por padrao o VSS e usado para\n"
         "               copiar o disco com o Windows ligado de forma consistente.\n"
         "Opcoes de restore:\n"
@@ -2602,7 +3522,8 @@ static void usage(void)
         "  --force      ignora avisos (volumes em uso, setor diferente)\n\n"
         "Exemplos:\n"
         "  hdclone backup 1 E:\\backup\\pc-sala.hdc\n"
-        "  hdclone restore E:\\backup\\pc-sala.hdc 2\n\n"
+        "  hdclone restore E:\\backup\\pc-sala.hdc 2\n"
+        "  hdclone extract E:\\backup\\pc-sala.hdc 1 \"Users\\Ana\\Documents\" D:\\recuperado\n\n"
         "Execute como Administrador. O disco do Windows em uso e copiado de forma\n"
         "consistente via VSS (Windows 64 bits: deixe o hdclone64.exe na mesma pasta).\n");
 }
@@ -2654,7 +3575,7 @@ static void interactive(Opts *o)
 int main(int argc, char **argv)
 {
     Opts o;
-    char *pos[3];
+    char *pos[6];
     int np = 0, i;
     memset(&o, 0, sizeof(o));
     o.level = 6;
@@ -2685,7 +3606,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--zero-free")) o.zero_free = 1;
         else if (!strcmp(argv[i], "--no-vss")) o.no_vss = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help") || !strcmp(argv[i], "/?")) { usage(); return 0; }
-        else if (np < 3) pos[np++] = argv[i];
+        else if (!strcmp(argv[i], "--keep-sys")) o.keep_sys = 1;
+        else if (np < 6) pos[np++] = argv[i];
         else { usage(); return 1; }
     }
     if (np == 1 && !strcmp(pos[0], "list")) cmd_list();
@@ -2693,6 +3615,8 @@ int main(int argc, char **argv)
     else if (np == 3 && !strcmp(pos[0], "restore")) cmd_restore(pos[1], pos[2], &o);
     else if (np == 2 && !strcmp(pos[0], "verify")) cmd_verify(pos[1]);
     else if (np == 2 && !strcmp(pos[0], "info")) cmd_info(pos[1]);
+    else if (np >= 2 && np <= 4 && !strcmp(pos[0], "ls")) cmd_ls(pos[1], np > 2 ? pos[2] : NULL, np > 3 ? pos[3] : NULL);
+    else if (np == 5 && !strcmp(pos[0], "extract")) cmd_extract(pos[1], pos[2], pos[3], pos[4]);
     else { usage(); return 1; }
     return 0;
 }

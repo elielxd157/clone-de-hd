@@ -9,7 +9,7 @@ CFLAGS  = -O2 -Wall -Wextra
 LIBS    = -static -static-libgcc -lz -lole32
 XP32    = -Wl,--major-subsystem-version,5,--minor-subsystem-version,1,--major-os-version,5,--minor-os-version,1
 XP64    = -Wl,--major-subsystem-version,5,--minor-subsystem-version,2,--major-os-version,5,--minor-os-version,2
-GUILIBS = -mwindows -lcomctl32 -lcomdlg32
+GUILIBS = -mwindows -lcomctl32 -lcomdlg32 -lshell32
 
 all: hdclone.exe hdclone-gui.exe hdclone64.exe hdclone-gui64.exe
 
