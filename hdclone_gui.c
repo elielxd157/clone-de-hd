@@ -25,7 +25,7 @@ enum {
     ID_LBL_DISK, ID_REFRESH, ID_LIST,
     ID_LBL_IMG, ID_PATH, ID_BROWSE, ID_IMGINFO,
     ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE, ID_VSS,
-    ID_START, ID_CANCEL, ID_PROGRESS, ID_STATUS, ID_LOG, ID_GRP_MODE
+    ID_START, ID_CANCEL, ID_PROGRESS, ID_STATUS, ID_LOG, ID_GRP_MODE, ID_INCR, ID_BASE, ID_BASEBR
 };
 
 #define WM_APP_LOG (WM_APP + 1)
@@ -43,6 +43,7 @@ typedef struct {
     int mode;
     char disk[16];
     char path[MAX_PATH * 2];
+    char base[MAX_PATH * 2]; /* backup incremental: imagem base */
     Opts o;
 } Job;
 
@@ -52,7 +53,7 @@ typedef struct {
     unsigned long eta;
 } Prog;
 
-static HWND g_hwnd, g_list, g_log, g_prog, g_status, g_path, g_imginfo, g_comp, g_target;
+static HWND g_hwnd, g_list, g_log, g_prog, g_status, g_path, g_imginfo, g_comp, g_target, g_base;
 static HFONT g_font, g_bold;
 static int g_mode = MODE_BACKUP;
 static int g_running, g_close_after, g_job_sysdisk;
@@ -194,16 +195,9 @@ static int peek_header(const char *path, Hdr *h)
     if (f == INVALID_HANDLE_VALUE) return -1;
     ReadFile(f, b, HDR_SIZE, &r, NULL);
     CloseHandle(f);
-    if (r != HDR_SIZE || memcmp(b, "HDCLONE", 8) != 0 || le32(b + 508) != (u32)crc32(0, b, 508)) return -2;
-    h->version = le32(b + 8);
-    if (h->version < 1 || h->version > 2) return -3;
-    h->sector = le32(b + 12);
-    h->flags = le32(b + 20);
-    h->size = le64(b + 24);
-    h->created = le64(b + 40);
-    memcpy(h->src, b + 48, 128);
-    h->src[128] = 0;
-    return 0;
+    if (r != HDR_SIZE) return -2;
+    if (hdr_parse(b, h) == NULL) return 0;
+    return memcmp(b, "HDCLONE", 8) == 0 && le32(b + 508) == (u32)crc32(0, b, 508) && le32(b + 8) > 3 ? -3 : -2;
 }
 
 static void update_imginfo(void)
@@ -233,9 +227,15 @@ static void update_imginfo(void)
         struct tm *tm = localtime(&tt);
         if (tm) wcsftime(dt, 64, L"%d/%m/%Y %H:%M", tm);
     }
-    swprintf(t, 400, L"Imagem de um disco de %ls, criada em %ls (%ls, %ls).", sz, dt,
-             (h.flags & 1) ? L"somente dados usados" : L"setor a setor",
-             h.version >= 2 ? L"zstd" : L"zlib");
+    if (h.flags & HF_INCR) {
+        wchar_t pn[260];
+        MultiByteToWideChar(CP_ACP, 0, h.pname, -1, pn, 260);
+        swprintf(t, 400, L"Incremental de %ls (disco de %ls, criada em %ls). Precisa de \"%ls\" na mesma pasta.",
+                 pn, sz, dt, pn);
+    } else
+        swprintf(t, 400, L"Imagem de um disco de %ls, criada em %ls (%ls, %ls).", sz, dt,
+                 (h.flags & 1) ? L"somente dados usados" : L"setor a setor",
+                 h.version >= 2 ? L"zstd" : L"zlib");
     SetWindowTextW(g_imginfo, t);
 }
 
@@ -331,6 +331,9 @@ static void set_mode(int m)
                                           : L"Verificar ao terminar (lê tudo de volta)");
     EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), rs || cl);
     EnableWindow(GetDlgItem(g_hwnd, ID_SKIPRP), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_INCR), bk);
+    EnableWindow(g_base, bk && IsDlgButtonChecked(g_hwnd, ID_INCR) == BST_CHECKED);
+    EnableWindow(GetDlgItem(g_hwnd, ID_BASEBR), bk && IsDlgButtonChecked(g_hwnd, ID_INCR) == BST_CHECKED);
     SetDlgItemTextW(g_hwnd, ID_START, bk   ? L"Iniciar backup"
                                       : rs ? L"Iniciar restauração"
                                       : cl ? L"Iniciar clone"
@@ -359,6 +362,9 @@ static void set_running(int r)
         EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_SKIPRP), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_INCR), FALSE);
+        EnableWindow(g_base, FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_BASEBR), FALSE);
         EnableWindow(g_target, FALSE);
     } else {
         set_mode(g_mode);
@@ -389,6 +395,37 @@ static void browse(void)
         ok = GetOpenFileNameW(&of);
     }
     if (ok) SetWindowTextW(g_path, file);
+}
+
+/* backup incremental: escolhe a imagem base e sugere o nome da nova imagem na mesma pasta */
+static void browse_base(void)
+{
+    wchar_t file[MAX_PATH * 2] = L"", cur[MAX_PATH * 2];
+    OPENFILENAMEW of;
+    GetWindowTextW(g_base, file, MAX_PATH * 2);
+    memset(&of, 0, sizeof(of));
+    of.lStructSize = OPENFILENAME_SIZE_VERSION_400W;
+    of.hwndOwner = g_hwnd;
+    of.lpstrFilter = L"Imagens do hdclone (*.hdc)\0*.hdc\0";
+    of.lpstrFile = file;
+    of.nMaxFile = MAX_PATH * 2;
+    of.lpstrTitle = L"Imagem base (o backup anterior deste disco)";
+    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&of)) return;
+    SetWindowTextW(g_base, file);
+    GetWindowTextW(g_path, cur, MAX_PATH * 2);
+    if (!cur[0] || !_wcsicmp(cur, file)) { /* sugere "<base>-AAAA-MM-DD.hdc" na mesma pasta */
+        wchar_t sug[MAX_PATH * 2], *dot;
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wcscpy(sug, file);
+        dot = wcsrchr(sug, L'.');
+        if (dot && dot > wcsrchr(sug, L'\\')) *dot = 0;
+        if (wcslen(sug) < MAX_PATH * 2 - 24)
+            swprintf(sug + wcslen(sug), 24, L"-%04d-%02d-%02d_%02d%02d.hdc", st.wYear, st.wMonth, st.wDay, st.wHour,
+                     st.wMinute);
+        SetWindowTextW(g_path, sug);
+    }
 }
 
 /* backup interrompido? (cabecalho valido, mas sem indice nem rodape no fim) */
@@ -463,8 +500,20 @@ static void start(void)
         if (!strchr(g_job.path, '.') || strrchr(g_job.path, '.') < strrchr(g_job.path, '\\')) {
             strcat(g_job.path, ".hdc");
         }
+        if (IsDlgButtonChecked(g_hwnd, ID_INCR) == BST_CHECKED) {
+            wchar_t w[MAX_PATH * 2];
+            Hdr bh;
+            BOOL bad = FALSE;
+            GetWindowTextW(g_base, w, MAX_PATH * 2);
+            if (!w[0]) { msgbox(L"Escolha a imagem base (o backup anterior deste disco): botão \"...\".", MB_ICONINFORMATION); return; }
+            WideCharToMultiByte(CP_ACP, 0, w, -1, g_job.base, sizeof(g_job.base), NULL, &bad);
+            if (bad || peek_header(g_job.base, &bh) != 0) { msgbox(L"A imagem base não foi encontrada ou não é uma imagem do hdclone.", MB_ICONERROR); return; }
+            if (g_job.o.compat) { msgbox(L"O backup incremental não funciona com a compressão \"Compatível com versões antigas\". Escolha outra.", MB_ICONINFORMATION); return; }
+            if (bh.size != d->size) { msgbox(L"A imagem base é de outro disco (tamanho diferente). Escolha o backup anterior DESTE disco.", MB_ICONERROR); return; }
+            g_job.o.base = g_job.base;
+        }
         if (GetFileAttributesA(g_job.path) != INVALID_FILE_ATTRIBUTES) {
-            if (image_incomplete(g_job.path) && !d->is_system) {
+            if (image_incomplete(g_job.path) && !d->is_system && !g_job.o.base) {
                 int a = MessageBoxW(g_hwnd,
                                     L"Já existe um backup INCOMPLETO neste arquivo (foi interrompido).\n\n"
                                     L"Sim: continuar de onde parou (use só se o disco de origem não foi usado "
@@ -664,7 +713,7 @@ static void create_controls(void)
     ShowWindow(g_target, SW_HIDE);
     g_imginfo = ctl(L"STATIC", L"", SS_LEFT, 12, 268, 618, 18, ID_IMGINFO);
 
-    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 150, ID_GRP_OPT);
+    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 178, ID_GRP_OPT);
     ctl(L"STATIC", L"Compressão:", SS_LEFT, 24, 312, 80, 18, ID_LBL_COMP);
     g_comp = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 104, 308, 180, 140, ID_COMP);
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Rápida (arquivo maior)");
@@ -683,15 +732,18 @@ static void create_controls(void)
     ctl(L"BUTTON", L"Preparar p/ outro PC (evita tela azul 0x7B)", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 388, 284, 20, ID_HWFIX);
     ctl(L"BUTTON", L"Deixar de fora pontos de restauração e despejos de memória (MEMORY.DMP) - imagem menor",
         BS_AUTOCHECKBOX | WS_TABSTOP, 24, 414, 596, 20, ID_SKIPRP);
+    ctl(L"BUTTON", L"Incremental: só o que mudou desde", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 440, 232, 20, ID_INCR);
+    g_base = ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 258, 438, 322, 22, ID_BASE);
+    ctl(L"BUTTON", L"...", BS_PUSHBUTTON | WS_TABSTOP, 586, 437, 34, 24, ID_BASEBR);
     CheckDlgButton(g_hwnd, ID_KEEPSYS, BST_CHECKED);
     CheckDlgButton(g_hwnd, ID_VSS, BST_CHECKED);
 
-    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 450, 160, 30, ID_START);
-    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 450, 100, 30, ID_CANCEL);
-    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 457, 338, 20, ID_STATUS);
-    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 488, 620, 20, ID_PROGRESS);
+    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 478, 160, 30, ID_START);
+    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 478, 100, 30, ID_CANCEL);
+    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 485, 338, 20, ID_STATUS);
+    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 516, 620, 20, ID_PROGRESS);
     SendMessageW(g_prog, PBM_SETRANGE32, 0, 1000);
-    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 516, 620, 150, ID_LOG);
+    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 544, 620, 150, ID_LOG);
     SendMessageW(g_log, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
 
     /* As molduras (group box) foram criadas antes do que fica dentro delas e por isso
@@ -721,6 +773,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case ID_MODE_CLONE: set_mode(MODE_CLONE); break;
         case ID_REFRESH: refresh_disks(); break;
         case ID_BROWSE: browse(); break;
+        case ID_BASEBR: browse_base(); break;
+        case ID_INCR:
+            set_mode(g_mode);
+            if (IsDlgButtonChecked(g_hwnd, ID_INCR) == BST_CHECKED && GetWindowTextLengthW(g_base) == 0) browse_base();
+            break;
         case ID_START: start(); break;
         case ID_SELFTEST: start_selftest(); break;
         case ID_CANCEL: cancel(1); break;
@@ -1509,7 +1566,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpszClassName = L"hdcloneGui";
     RegisterClassW(&wc);
 
-    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(676);
+    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(704);
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     CreateWindowW(L"hdcloneGui", APP_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                   CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);

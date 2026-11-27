@@ -699,6 +699,41 @@ static void st_more(void)
     remove(st_path("r3.img"));
     cmd_restore(st_path("raw.hdc"), st_path("r3.img"), &o);
     ST_CHECK(st_same_files(disk, st_path("r3.img")), "modo setor a setor: restauracao identica byte a byte");
+    /* incremental: muda 2 trechos do disco, grava so o que mudou e restaura a cadeia */
+    {
+        FILE *f = fopen(disk, "rb");
+        u8 *b = malloc(ST_DISK);
+        u64 full = 0, inc = 0, k;
+        i64 ps;
+        int ok = f && b && fread(b, 1, ST_DISK, f) == ST_DISK;
+        if (f) fclose(f);
+        if (ok) {
+            for (k = 0; k < 4096; k++) { b[20u * 1048576 + k] ^= (u8)(k * 37 + 1); b[45u * 1048576 + 512 + k] = (u8)k; }
+            ok = st_write_file(st_path("d2.img"), b, ST_DISK) == 0;
+        }
+        free(b);
+        ST_CHECK(ok, "disco alterado para o teste do incremental");
+        if (ok) {
+            o = st_opts();
+            o.raw = 1;
+            {
+                char basep[800], d2[800], incp[800];
+                snprintf(basep, sizeof(basep), "%s", st_path("raw.hdc"));
+                snprintf(d2, sizeof(d2), "%s", st_path("d2.img"));
+                snprintf(incp, sizeof(incp), "%s", st_path("inc.hdc"));
+                o.base = basep;
+                cmd_backup(d2, incp, &o);
+            }
+            for (k = 1; (ps = part_size(st_path("raw.hdc"), (int)k)) >= 0; k++) full += (u64)ps;
+            for (k = 1; (ps = part_size(st_path("inc.hdc"), (int)k)) >= 0; k++) inc += (u64)ps;
+            ST_CHECK(inc * 8 < full, "backup incremental: %.1f MB contra %.1f MB do completo", (double)inc / 1048576,
+                     (double)full / 1048576);
+            remove(st_path("r6.img"));
+            o = st_opts();
+            cmd_restore(st_path("inc.hdc"), st_path("r6.img"), &o);
+            ST_CHECK(st_same_files(st_path("d2.img"), st_path("r6.img")), "restauracao do incremental identica byte a byte");
+        }
+    }
     /* formato compativel (zlib) */
     o = st_opts();
     o.compat = 1;

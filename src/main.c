@@ -33,6 +33,9 @@ static void usage(void)
         "  --raw        copia setor a setor, inclusive espaco livre\n"
         "  --verify     backup/clone: ao terminar, le tudo de volta e confere\n"
         "               restore: confere a imagem inteira ANTES de apagar o disco de destino\n"
+        "  --base IMG   backup INCREMENTAL: grava so os blocos que mudaram desde a imagem IMG\n"
+        "               (completa ou incremental). A nova imagem fica na mesma pasta e precisa\n"
+        "               de todas as anteriores da cadeia para restaurar.\n"
         "  --resume     continua um backup interrompido (cabo solto, falta de energia...)\n"
         "  --skip-restore-points  deixa de fora (grava como zeros) os pontos de restauracao\n"
         "               do Windows Vista+ e os despejos de memoria (MEMORY.DMP etc.)\n"
@@ -49,6 +52,7 @@ static void usage(void)
         "  --force      ignora avisos (volumes em uso, setor diferente)\n\n"
         "Exemplos:\n"
         "  hdclone backup 1 E:\\backup\\pc-sala.hdc\n"
+        "  hdclone backup 1 E:\\backup\\pc-sala-2.hdc --base E:\\backup\\pc-sala.hdc\n"
         "  hdclone restore E:\\backup\\pc-sala.hdc 2\n"
         "  hdclone extract E:\\backup\\pc-sala.hdc 1 \"Users\\Ana\\Documents\" D:\\recuperado\n\n"
         "Execute como Administrador. O disco do Windows em uso e copiado de forma\n"
@@ -128,6 +132,8 @@ int main(int argc, char **argv)
             u64 v = 0;
             while (*q >= '0' && *q <= '9') v = v * 10 + (u64)(*q++ - '0');
             o.split = v * 1024 * 1024;
+        } else if (!strcmp(argv[i], "--base") && i + 1 < argc) {
+            o.base = argv[++i];
         } else if (!strcmp(argv[i], "--raw")) o.raw = 1;
         else if (!strcmp(argv[i], "-y")) o.yes = 1;
         else if (!strcmp(argv[i], "--force")) o.force = 1;

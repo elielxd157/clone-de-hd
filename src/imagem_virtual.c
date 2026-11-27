@@ -72,13 +72,14 @@ typedef struct {
 
 #define IMG_CACHE 8 /* blocos descomprimidos em cache (MFT + dados alternam muito) */
 
-typedef struct {
+typedef struct ImgSrc {
     Img m;
     Hdr h;
     ChunkIdx *ix;
     u8 *cache[IMG_CACHE], *cbuf;
     i64 ci[IMG_CACHE];
     u64 used[IMG_CACHE], tick;
+    struct ImgSrc *parent; /* incremental: imagem base */
 } ImgSrc;
 
 static ImgSrc g_is;
@@ -87,81 +88,68 @@ static int g_idx_used; /* ultima imagem aberta pelo indice */
 /* le o indice do fim da imagem; 0 = ok (s->ix preenchido) */
 static int imgsrc_try_index(ImgSrc *s, const char *path)
 {
-    u64 sizes[1000], total = 0, g, rawlen, cl, off, i;
-    int np = 0, k, part;
-    u8 t[IDX_TRAILER], *cz = NULL, *raw = NULL;
+    u64 sizes[1000], g, i;
+    int np = 0, part;
+    u8 *raw;
     i64 sz;
-    while (np < 1000 && (sz = part_size(path, np + 1)) >= 0) { sizes[np++] = (u64)sz; total += (u64)sz; }
-    if (!np || total < HDR_SIZE + FTR_SIZE + IDX_TRAILER) return -1;
-#define G2P(gv, pp, oo)                                                   \
-    do {                                                                  \
-        u64 _g = (gv);                                                    \
-        for (pp = 0; pp < np - 1 && _g >= sizes[pp]; pp++) _g -= sizes[pp]; \
-        oo = _g;                                                          \
-    } while (0)
-    G2P(total - IDX_TRAILER, k, off);
-    if (img_seek(&s->m, k + 1, off) != 0 || img_read(&s->m, t, IDX_TRAILER) != 0) return -1;
-    if (memcmp(t, "HDCIDX\0\1", 8) != 0 || le32(t + 60) != (u32)crc32(0, t, 60)) return -1;
-    rawlen = le64(t + 16);
-    cl = le64(t + 24);
-    if (le64(t + 8) != s->h.nchunks || rawlen != s->h.nchunks * 9 || le64(t + 32) + cl + IDX_TRAILER != total ||
-        cl > 64ull * 1024 * 1024)
-        return -1;
-    cz = malloc((size_t)cl + 1);
-    raw = malloc((size_t)rawlen + 1);
-    if (!cz || !raw) goto fail;
-    G2P(le64(t + 32), k, off);
-    if (img_seek(&s->m, k + 1, off) != 0 || img_read(&s->m, cz, cl) != 0) goto fail;
-    if (ZSTD_decompress(raw, (size_t)rawlen, cz, (size_t)cl) != rawlen || le32(t + 40) != (u32)crc32(0, raw, (uInt)rawlen))
-        goto fail;
+    if (idx_read(&s->m, path, s->h.nchunks, &raw, NULL) != 0) return -1;
+    while (np < 1000 && (sz = part_size(path, np + 1)) >= 0) sizes[np++] = (u64)sz;
     g = HDR_SIZE;
     for (i = 0; i < s->h.nchunks; i++) {
         ChunkIdx *c = &s->ix[i];
         c->type = raw[i * 9];
         c->stored = le32(raw + i * 9 + 1);
         c->crc = le32(raw + i * 9 + 5);
-        if (c->type > CH_ZSTD || c->stored > CBUF_SIZE) goto fail;
+        if (c->type > CH_SAME || c->stored > CBUF_SIZE) goto fail;
         g += 9;
         if (c->type == CH_DEFLATE || c->type == CH_RAW || c->type == CH_ZSTD) {
-            u64 o2;
-            G2P(g, part, o2);
-            c->part = part + 1;
-            c->pos = o2;
+            g2p(sizes, np, g, &part, &c->pos);
+            c->part = part;
             g += c->stored;
         }
     }
     { /* confere: o rodape tem que estar logo depois do ultimo bloco */
         u8 f[6];
-        G2P(g, k, off);
-        if (img_seek(&s->m, k + 1, off) != 0 || img_read(&s->m, f, 6) != 0 || memcmp(f, "HDCEND", 6) != 0) goto fail;
+        u64 off;
+        g2p(sizes, np, g, &part, &off);
+        if (img_seek(&s->m, part, off) != 0 || img_read(&s->m, f, 6) != 0 || memcmp(f, "HDCEND", 6) != 0) goto fail;
     }
-#undef G2P
-    free(cz);
     free(raw);
     return 0;
 fail:
-    free(cz);
     free(raw);
     return -1;
 }
 
-/* percorre a imagem lendo so os cabecalhos dos blocos e monta um indice */
-static void imgsrc_open(const char *path)
+static void imgsrc_close_s(ImgSrc *s)
 {
-    ImgSrc *s = &g_is;
+    int i;
+    if (s->parent) { imgsrc_close_s(s->parent); free(s->parent); }
+    img_close_part(&s->m);
+    xfree(s->ix);
+    for (i = 0; i < IMG_CACHE; i++) xfree(s->cache[i]);
+    xfree(s->cbuf);
+    memset(s, 0, sizeof(*s));
+}
+
+/* abre a imagem (e as imagens base, se for incremental) para acesso aleatorio */
+static void imgsrc_init(ImgSrc *s, const char *path, int depth)
+{
     u64 i = 0;
     memset(s, 0, sizeof(*s));
     if (img_open(&s->m, path, 0, 0) != 0) die("nao foi possivel abrir a imagem");
     read_header(&s->m, &s->h);
+    if (depth == 0) check_chain(path, &s->h);
     s->ix = xalloc((size_t)s->h.nchunks * sizeof(ChunkIdx));
     g_t0 = g_tlast = now_ms();
     if (imgsrc_try_index(s, path) == 0) {
-        printf("  (indice da imagem lido)\n");
-        g_idx_used = 1;
+        if (!depth) printf("  (indice da imagem lido)\n");
+        if (!depth) g_idx_used = 1;
         i = s->h.nchunks;
     } else if (img_seek(&s->m, 1, HDR_SIZE) != 0) {
         die("nao foi possivel ler a imagem");
     }
+    if (i < s->h.nchunks && depth) printf("  lendo a imagem base %s...\n", base_name(path));
     for (; i < s->h.nchunks; i++) {
         u8 ch[9];
         ChunkIdx *c = &s->ix[i];
@@ -170,7 +158,7 @@ static void imgsrc_open(const char *path)
         c->type = ch[0];
         c->stored = le32(ch + 1);
         c->crc = le32(ch + 5);
-        if (c->type > CH_ZSTD || c->stored > CBUF_SIZE) die("imagem corrompida");
+        if (c->type > CH_SAME || c->stored > CBUF_SIZE) die("imagem corrompida");
         if (c->type == CH_DEFLATE || c->type == CH_RAW || c->type == CH_ZSTD) {
             c->part = s->m.part;
             c->pos = s->m.pos;
@@ -184,18 +172,17 @@ static void imgsrc_open(const char *path)
         s->ci[i] = -1;
     }
     s->cbuf = xalloc(CBUF_SIZE);
+    if (s->h.flags & HF_INCR) { /* a cadeia ja foi conferida em check_chain */
+        char pp[700];
+        sibling_path(path, s->h.pname, pp, sizeof(pp));
+        s->parent = calloc(1, sizeof(ImgSrc));
+        if (!s->parent) die("memoria insuficiente");
+        imgsrc_init(s->parent, pp, depth + 1);
+    }
 }
 
-static void imgsrc_close(void)
-{
-    ImgSrc *s = &g_is;
-    int i;
-    img_close_part(&s->m);
-    xfree(s->ix);
-    for (i = 0; i < IMG_CACHE; i++) xfree(s->cache[i]);
-    xfree(s->cbuf);
-    memset(s, 0, sizeof(*s));
-}
+static void imgsrc_open(const char *path) { imgsrc_init(&g_is, path, 0); }
+static void imgsrc_close(void) { imgsrc_close_s(&g_is); }
 
 /* devolve o bloco i descomprimido (cache LRU) ou NULL */
 static u8 *imgsrc_chunk(ImgSrc *s, u64 i)
@@ -205,6 +192,10 @@ static u8 *imgsrc_chunk(ImgSrc *s, u64 i)
     u32 len = (u32)((s->h.size - off) < CHUNK_SIZE ? (s->h.size - off) : CHUNK_SIZE);
     int k, v = 0;
     u8 *dst;
+    if (c->type == CH_SAME) { /* igual ao bloco da imagem base */
+        u8 *p = s->parent ? imgsrc_chunk(s->parent, i) : NULL;
+        return p && (u32)crc32(0, p, len) == c->crc ? p : NULL;
+    }
     for (k = 0; k < IMG_CACHE; k++)
         if (s->ci[k] == (i64)i) { s->used[k] = ++s->tick; return s->cache[k]; }
     for (k = 1; k < IMG_CACHE; k++)

@@ -41,7 +41,8 @@ se o hdclone funciona direito **neste** computador, **sem alterar nenhum disco**
    (veja abaixo), sem excluir nada;
 5. a 7. num **disco virtual** (arquivo temporário com FAT32 gerado pelo próprio teste):
    backup, verificação, restauração (inclusive em disco menor), recuperar arquivos, busca,
-   clone, setor a setor, formato compatível, backup interrompido e imagem corrompida,
+   clone, setor a setor, backup incremental, formato compatível, backup interrompido e
+   imagem corrompida,
    tudo conferido byte a byte;
 8. velocidade de compressão.
 
@@ -100,6 +101,35 @@ novas (zstd) **não abrem em versões antigas do hdclone**; a versão antiga mos
 (por exemplo, num pendrive de boot antigo), escolha **Compatível com versões
 antigas** ou use `--compat`. Nesse modo, blocos que não comprimem (fotos, vídeos,
 zip) são detectados rapidamente e gravados direto.
+
+## Backup incremental (só o que mudou)
+
+Depois do primeiro backup completo, os próximos podem gravar **só os blocos que
+mudaram**. Na interface: marque **"Incremental: só o que mudou desde"** e escolha a
+imagem anterior (o nome da nova imagem é sugerido com a data). Na linha de comando:
+
+```
+hdclone backup 0 E:\backup\pc.hdc                                 completo (a base)
+hdclone backup 0 E:\backup\pc-2026-11-28.hdc --base E:\backup\pc.hdc
+hdclone backup 0 E:\backup\pc-2026-11-29.hdc --base E:\backup\pc-2026-11-28.hdc
+```
+
+- O disco ainda é lido inteiro (o espaço usado), mas os blocos iguais aos da imagem
+  anterior não são comprimidos nem gravados: a imagem fica com o tamanho do que mudou
+  e o backup termina bem mais rápido.
+- Cada bloco é comparado pelo CRC32 **e** por uma soma XXH64 (96 bits no total).
+- Pode encadear: um incremental pode ser a base do próximo. Restaurar, verificar e
+  recuperar arquivos funcionam com a **última** imagem da cadeia; o hdclone busca o
+  restante nas anteriores.
+- **Todas as imagens da cadeia precisam ficar juntas na mesma pasta**, com os nomes
+  originais. Se faltar uma, ou se uma for substituída por outro backup com o mesmo
+  nome, o hdclone avisa qual é e não grava nada.
+- A base precisa ter sido criada por esta versão (a tabela de blocos que o incremental
+  usa é gravada desde a versão com incremental). Um backup interrompido e continuado
+  (`--resume`) não serve de base.
+- Não funciona com o formato "Compatível com versões antigas".
+- Dica: de tempos em tempos faça um completo novo, para a cadeia não ficar longa
+  (se uma imagem antiga estragar, as seguintes dependem dela).
 
 ## Clonar disco para disco
 
@@ -282,7 +312,7 @@ Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
 Opções: `-c N` (compressão zstd 1–19, padrão 3), `--compat` (formato antigo zlib), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
-`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--verify`, `--hwfix`, `--resume`, `--skip-restore-points`, `--rescue-all`, `--force`.
+`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--verify`, `--hwfix`, `--resume`, `--skip-restore-points`, `--rescue-all`, `--force`, `--base IMG` (incremental).
 
 ## Importante
 

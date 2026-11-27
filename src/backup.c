@@ -126,6 +126,7 @@ typedef struct {
     u64 idx;
     u32 len, stored, crc;
     u8 type;
+    u64 hash;   /* XXH64 dos dados do bloco (backup) */
     u8 *buf, *cbuf;
     const u8 *out; /* restauracao: dados a gravar (NULL = pular) */
 } Slot;
@@ -308,6 +309,7 @@ typedef struct {
     int skip_restore; /* pontos de restauracao e despejos de memoria gravados como zeros */
     int resume;   /* continuar um backup interrompido */
     int hwfix;    /* preparar o Windows restaurado/clonado para outro hardware */
+    const char *base; /* backup incremental: imagem base */
 } Opts;
 
 static int g_vss_used; /* ultimo backup usou VSS */
@@ -329,6 +331,10 @@ typedef struct {
     u64 unread;   /* bytes nao recuperados (setores defeituosos ou area pulada) */
     u64 rfails;   /* leituras que falharam */
     int bad_streak; /* blocos seguidos totalmente ilegiveis ("zona ruim") */
+    u64 *hashes;  /* XXH64 de cada bloco (gravado no fim da imagem) */
+    const u8 *pix;     /* incremental: cabecalhos dos blocos da imagem base */
+    const u64 *phash;  /* incremental: XXH64 dos blocos da imagem base */
+    u64 same;     /* bytes iguais a imagem base (nao gravados) */
 } BkCtx;
 
 /* ---- leitura de bloco com setores defeituosos ----
@@ -409,6 +415,7 @@ static int bk_produce(Pipe *p, Slot *sl)
     int any_free = 0, any_read = 0, any_zero = 0, f, k;
     sl->len = len;
     sl->stored = sl->crc = 0;
+    sl->hash = 0;
     if (!c->o->raw && g_nareas) {
         for (pp = off; pp < off + len; pp = q) {
             q = seg_next(pp, off + len, &f);
@@ -458,6 +465,16 @@ static int bk_work(Pipe *p, Slot *sl, int w)
     BkCtx *c = p->ctx;
     if (sl->type != T_PENDING) return 0;
     sl->crc = (u32)crc32(0, sl->buf, sl->len);
+    sl->hash = hash64(sl->buf, sl->len);
+    if (c->phash) { /* incremental: igual ao bloco da base (CRC32 + XXH64) = nao grava */
+        const u8 *pc = c->pix + sl->idx * 9;
+        if ((pc[0] == CH_DEFLATE || pc[0] == CH_RAW || pc[0] == CH_ZSTD || pc[0] == CH_SAME) &&
+            le32(pc + 5) == sl->crc && c->phash[sl->idx] == sl->hash) {
+            sl->type = CH_SAME;
+            sl->stored = 0;
+            return 0;
+        }
+    }
     if (!c->o->compat) {
         size_t r = ZSTD_compressCCtx(c->zc[w], sl->cbuf, CBUF_SIZE, sl->buf, sl->len, c->o->level);
         if (!ZSTD_isError(r) && r < sl->len) { sl->type = CH_ZSTD; sl->stored = (u32)r; }
@@ -495,6 +512,8 @@ static int bk_consume(Pipe *p, Slot *sl)
     put32(ch + 1, sl->stored);
     put32(ch + 5, sl->crc);
     if (c->idx) memcpy(c->idx + sl->idx * 9, ch, 9);
+    if (c->hashes) c->hashes[sl->idx] = sl->hash;
+    if (sl->type == CH_SAME) c->same += sl->len;
     if (img_write_nd(c->m, ch, 9) != 0 ||
         (sl->type == CH_DEFLATE || sl->type == CH_ZSTD ? img_write_nd(c->m, sl->cbuf, sl->stored)
          : sl->type == CH_RAW ? img_write_nd(c->m, sl->buf, sl->stored) : 0) != 0) {
@@ -510,17 +529,20 @@ typedef struct {
     u32 version, sector, chunk, flags;
     u64 size, nchunks, created;
     char src[129], tool[33];
+    u32 hcrc;           /* CRC do proprio cabecalho (identifica a imagem) */
+    u64 pcreated;       /* incremental: data e CRC do cabecalho da imagem base */
+    u32 phcrc;
+    char pname[256];    /* incremental: nome do arquivo da base (mesma pasta) */
 } Hdr;
 
-static void read_header(Img *m, Hdr *h)
+/* NULL = ok; senao, o motivo */
+static const char *hdr_parse(const u8 *b, Hdr *h)
 {
-    u8 b[HDR_SIZE];
-    if (img_read(m, b, HDR_SIZE) != 0) die("arquivo de imagem vazio ou ilegivel");
-    if (memcmp(b, "HDCLONE", 8) != 0) die("este arquivo nao e uma imagem do hdclone");
-    if (le32(b + 508) != (u32)crc32(0, b, 508)) die("cabecalho da imagem corrompido");
+    if (memcmp(b, "HDCLONE", 8) != 0) return "este arquivo nao e uma imagem do hdclone";
+    if (le32(b + 508) != (u32)crc32(0, b, 508)) return "cabecalho da imagem corrompido";
     h->version = le32(b + 8);
-    if (h->version < 1 || h->version > 2)
-        die("esta imagem foi criada por uma versao mais nova do hdclone; atualize o programa");
+    if (h->version < 1 || h->version > 3)
+        return "esta imagem foi criada por uma versao mais nova do hdclone; atualize o programa";
     h->sector = le32(b + 12);
     h->chunk = le32(b + 16);
     h->flags = le32(b + 20);
@@ -529,8 +551,22 @@ static void read_header(Img *m, Hdr *h)
     h->created = le64(b + 40);
     memcpy(h->src, b + 48, 128); h->src[128] = 0;
     memcpy(h->tool, b + 176, 32); h->tool[32] = 0;
-    if (h->chunk != CHUNK_SIZE || h->nchunks != (h->size + h->chunk - 1) / h->chunk)
-        die("cabecalho da imagem invalido");
+    h->hcrc = le32(b + 508);
+    h->pcreated = le64(b + 208);
+    h->phcrc = le32(b + 216);
+    memcpy(h->pname, b + 224, 255); h->pname[255] = 0;
+    if (h->chunk != CHUNK_SIZE || h->nchunks != (h->size + h->chunk - 1) / h->chunk ||
+        ((h->flags & HF_INCR) && (h->version < 3 || !h->pname[0])))
+        return "cabecalho da imagem invalido";
+    return NULL;
+}
+
+static void read_header(Img *m, Hdr *h)
+{
+    u8 b[HDR_SIZE];
+    const char *e;
+    if (img_read(m, b, HDR_SIZE) != 0) die("arquivo de imagem vazio ou ilegivel");
+    if ((e = hdr_parse(b, h)) != NULL) die(e);
 }
 
 static void print_header(Hdr *h)
@@ -546,6 +582,8 @@ static void print_header(Hdr *h)
     printf("  Modo           : %s%s\n", (h->flags & 1) ? "inteligente (somente dados usados)" : "setor a setor",
            (h->flags & 2) ? ", copia consistente via VSS" : "");
     printf("  Compressao     : %s\n", h->version >= 2 ? "zstd" : "zlib (formato compativel com versoes antigas)");
+    if (h->flags & HF_INCR)
+        printf("  Incremental    : so o que mudou desde \"%s\" (que precisa estar na mesma pasta)\n", h->pname);
 }
 
 /* tamanho de cada parte da imagem (-1 = nao existe) */
@@ -629,6 +667,10 @@ static void check_dest_space(const char *dst, u64 data, Opts *o)
         o->split = 4000ull * 1024 * 1024;
         printf("  O destino e FAT32 (arquivos de no maximo 4 GB): a imagem sera dividida em partes\n"
                "  de 4000 MB automaticamente.\n");
+    }
+    if (o->base) { /* incremental: so os blocos alterados serao gravados */
+        printf("  Incremental: so os blocos que mudaram desde a imagem base serao gravados.\n");
+        return;
     }
     if (avail < data / 10 * 3) { /* nem com compressao muito boa caberia */
         snprintf(msg, sizeof(msg), "espaco insuficiente no destino: %s livres para %s de dados (a imagem costuma "
@@ -773,14 +815,25 @@ static void img_open_append(Img *m, const char *path, u64 limit, int part, u64 o
    alguns KB em vez de percorrer a imagem inteira. */
 #define IDX_TRAILER 64
 
-static void img_write_index(Img *m, const u8 *raw, u64 nchunks)
+static void img_write_index(Img *m, const u8 *raw, u64 nchunks, const u64 *hashes)
 {
-    u64 rawlen = nchunks * 9, off;
+    u64 rawlen = nchunks * 9, off, hoff = 0, i;
+    u32 hcrc = 0;
     size_t cap = ZSTD_compressBound((size_t)rawlen), cl;
     u8 *cz = malloc(cap), t[IDX_TRAILER];
     if (!cz) return; /* sem indice: a imagem continua valida */
     cl = ZSTD_compress(cz, cap, raw, (size_t)rawlen, 3);
     if (ZSTD_isError(cl)) { free(cz); return; }
+    if (hashes) { /* XXH64 de cada bloco (8 bytes cada), antes do indice */
+        u8 *hb = malloc((size_t)nchunks * 8 + 1);
+        if (hb) {
+            for (i = 0; i < nchunks; i++) put64(hb + i * 8, hashes[i]);
+            hoff = m->total;
+            img_write(m, hb, nchunks * 8);
+            hcrc = (u32)crc32(0, hb, (uInt)(nchunks * 8));
+            free(hb);
+        }
+    }
     off = m->total;
     img_write(m, cz, cl);
     free(cz);
@@ -791,17 +844,147 @@ static void img_write_index(Img *m, const u8 *raw, u64 nchunks)
     put64(t + 24, cl);
     put64(t + 32, off);
     put32(t + 40, (u32)crc32(0, raw, (uInt)rawlen));
+    /* 44..59: tabela de XXH64 (versoes antigas ignoram estes campos) */
+    put64(t + 44, hoff);
+    put32(t + 52, hcrc);
+    put32(t + 56, hoff ? 1 : 0);
     put32(t + 60, (u32)crc32(0, t, 60));
     img_write(m, t, IDX_TRAILER);
+}
+
+/* posicao global -> (parte, posicao na parte) */
+static void g2p(const u64 *sizes, int np, u64 g, int *part, u64 *off)
+{
+    int k;
+    for (k = 0; k < np - 1 && g >= sizes[k]; k++) g -= sizes[k];
+    *part = k + 1;
+    *off = g;
+}
+
+/* le o indice do fim da imagem: cabecalhos dos blocos (raw, nchunks*9 bytes) e, se
+   houver, a tabela de XXH64. 0 = ok; liberar com free() */
+static int idx_read(Img *m, const char *path, u64 nchunks, u8 **rawp, u64 **hashp)
+{
+    u64 sizes[1000], total = 0, rawlen, cl, off, i;
+    int np = 0, k;
+    u8 t[IDX_TRAILER], *cz = NULL, *raw = NULL, *hb = NULL;
+    u64 *hs = NULL;
+    i64 sz;
+    *rawp = NULL;
+    if (hashp) *hashp = NULL;
+    while (np < 1000 && (sz = part_size(path, np + 1)) >= 0) { sizes[np++] = (u64)sz; total += (u64)sz; }
+    if (!np || total < HDR_SIZE + FTR_SIZE + IDX_TRAILER) return -1;
+    g2p(sizes, np, total - IDX_TRAILER, &k, &off);
+    if (img_seek(m, k, off) != 0 || img_read(m, t, IDX_TRAILER) != 0) return -1;
+    if (memcmp(t, "HDCIDX\0\1", 8) != 0 || le32(t + 60) != (u32)crc32(0, t, 60)) return -1;
+    rawlen = le64(t + 16);
+    cl = le64(t + 24);
+    if (le64(t + 8) != nchunks || rawlen != nchunks * 9 || le64(t + 32) + cl + IDX_TRAILER != total ||
+        cl > 64ull * 1024 * 1024)
+        return -1;
+    cz = malloc((size_t)cl + 1);
+    raw = malloc((size_t)rawlen + 1);
+    if (!cz || !raw) goto fail;
+    g2p(sizes, np, le64(t + 32), &k, &off);
+    if (img_seek(m, k, off) != 0 || img_read(m, cz, cl) != 0) goto fail;
+    if (ZSTD_decompress(raw, (size_t)rawlen, cz, (size_t)cl) != rawlen || le32(t + 40) != (u32)crc32(0, raw, (uInt)rawlen))
+        goto fail;
+    if (hashp && le32(t + 56) == 1 && le64(t + 44) + nchunks * 8 == le64(t + 32)) {
+        hb = malloc((size_t)nchunks * 8 + 1);
+        hs = malloc((size_t)nchunks * 8 + 1);
+        if (!hb || !hs) goto fail;
+        g2p(sizes, np, le64(t + 44), &k, &off);
+        if (img_seek(m, k, off) == 0 && img_read(m, hb, nchunks * 8) == 0 &&
+            le32(t + 52) == (u32)crc32(0, hb, (uInt)(nchunks * 8))) {
+            for (i = 0; i < nchunks; i++) hs[i] = le64(hb + i * 8);
+            *hashp = hs;
+            hs = NULL;
+        }
+        free(hb);
+        free(hs);
+    }
+    free(cz);
+    *rawp = raw;
+    return 0;
+fail:
+    free(cz);
+    free(raw);
+    free(hb);
+    free(hs);
+    return -1;
+}
+
+/* ---- backup incremental: imagem base ---- */
+
+static const char *base_name(const char *p)
+{
+    const char *b = p, *q;
+    for (q = p; *q; q++)
+        if (*q == '/' || *q == '\\' || *q == ':') b = q + 1;
+    return b;
+}
+
+/* arquivo "name" na mesma pasta da imagem "path" */
+static void sibling_path(const char *path, const char *name, char *out, size_t cap)
+{
+    size_t dl = (size_t)(base_name(path) - path);
+    snprintf(out, cap, "%.*s%s", (int)(dl < cap ? dl : 0), path, name);
+}
+
+static int name_same(const char *a, const char *b)
+{
+#ifdef _WIN32
+    return _stricmp(a, b) == 0;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
+/* abre so o cabecalho; 0 = ok */
+static int hdr_peek(const char *path, Hdr *h)
+{
+    Img m;
+    u8 b[HDR_SIZE];
+    int ok;
+    if (img_open(&m, path, 0, 0) != 0) return -1;
+    ok = img_read(&m, b, HDR_SIZE) == 0 && hdr_parse(b, h) == NULL;
+    img_close_part(&m);
+    return ok ? 0 : -1;
+}
+
+/* confere a cadeia de imagens base a partir de "path" (todas na mesma pasta) */
+static void check_chain(const char *path, const Hdr *h0)
+{
+    Hdr h = *h0, ph;
+    char cur[700], nx[700], msg[1800];
+    int depth = 0;
+    snprintf(cur, sizeof(cur), "%s", path);
+    while (h.flags & HF_INCR) {
+        if (++depth > 64) die("cadeia de imagens incrementais longa demais (mais de 64)");
+        sibling_path(cur, h.pname, nx, sizeof(nx));
+        if (hdr_peek(nx, &ph) != 0) {
+            snprintf(msg, sizeof(msg), "falta a imagem base \"%s\" (precisa estar na mesma pasta de \"%s\")",
+                     h.pname, base_name(cur));
+            die(msg);
+        }
+        if (ph.created != h.pcreated || ph.hcrc != h.phcrc || ph.size != h.size) {
+            snprintf(msg, sizeof(msg), "a imagem \"%s\" nao e a base usada por \"%s\" (foi substituida por "
+                     "outro backup com o mesmo nome)", h.pname, base_name(cur));
+            die(msg);
+        }
+        h = ph;
+        snprintf(cur, sizeof(cur), "%s", nx);
+    }
 }
 
 static void cmd_backup(const char *src, const char *dst, Opts *o)
 {
     Dev d;
     Img m;
-    u8 hdr[HDR_SIZE], ftr[FTR_SIZE], *ixraw = NULL;
-    u64 nchunks, used = 0, bad = 0, nfree = 0;
+    u8 hdr[HDR_SIZE], ftr[FTR_SIZE], *ixraw = NULL, *pix = NULL;
+    u64 nchunks, used = 0, bad = 0, nfree = 0, same = 0, *phash = NULL, *hashes = NULL;
     ResumeInfo ri;
+    Hdr bh;
     char s1[32], s2[32];
 
     {
@@ -817,6 +1000,32 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
 
     if (d.disknum >= 0 && path_disk(dst) == d.disknum)
         die("a imagem nao pode ser gravada no mesmo disco que esta sendo copiado");
+
+    memset(&bh, 0, sizeof(bh));
+    if (o->base) { /* incremental: le o indice e a tabela de XXH64 da imagem base */
+        Img bm;
+        char sib[700];
+        Hdr sh;
+        if (o->compat) die("o backup incremental usa o formato normal (zstd); desmarque o formato compativel");
+        if (o->resume) die("um backup incremental interrompido nao pode ser continuado; faca-o de novo (e rapido)");
+        if (strlen(base_name(o->base)) > 250) die("nome da imagem base longo demais");
+        if (name_same(base_name(dst), base_name(o->base)))
+            die("a imagem incremental precisa de um nome diferente da imagem base");
+        if (img_open(&bm, o->base, 0, 0) != 0) die("nao foi possivel abrir a imagem base");
+        read_header(&bm, &bh);
+        printf("Base   : %s\n", o->base);
+        if (bh.size != d.size || bh.sector != d.sector)
+            die("a imagem base e de outro disco (tamanho diferente); faca um backup completo");
+        if (idx_read(&bm, o->base, bh.nchunks, &pix, &phash) != 0 || !phash)
+            die("a imagem base nao tem a tabela de blocos usada pelo incremental (foi criada por uma versao "
+                "anterior do hdclone, ou e um backup que foi interrompido e continuado). Faca um backup completo "
+                "com esta versao e use-o como base.");
+        img_close_part(&bm);
+        sibling_path(dst, base_name(o->base), sib, sizeof(sib));
+        if (hdr_peek(sib, &sh) != 0 || sh.hcrc != bh.hcrc || sh.created != bh.created)
+            die("a imagem incremental precisa ficar na mesma pasta da imagem base");
+        check_chain(o->base, &bh);
+    }
 
     g_vss_used = 0;
 #ifdef _WIN32
@@ -883,15 +1092,20 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     }
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, "HDCLONE", 8);
-    put32(hdr + 8, o->compat ? 1 : 2); /* 2 = pode conter blocos zstd */
+    put32(hdr + 8, o->base ? 3 : o->compat ? 1 : 2); /* 2 = pode conter blocos zstd; 3 = incremental */
     put32(hdr + 12, d.sector);
     put32(hdr + 16, CHUNK_SIZE);
-    put32(hdr + 20, (o->raw ? 0 : 1) | (g_vss_used ? 2 : 0));
+    put32(hdr + 20, (o->raw ? 0 : HF_SMART) | (g_vss_used ? HF_VSS : 0) | (o->base ? HF_INCR : 0));
     put64(hdr + 24, d.size);
     put64(hdr + 32, nchunks);
     put64(hdr + 40, (u64)time(NULL));
     memcpy(hdr + 48, d.name, strlen(d.name) < 127 ? strlen(d.name) : 127);
     strncpy((char *)hdr + 176, VERSION_STR, 31);
+    if (o->base) {
+        put64(hdr + 208, bh.created);
+        put32(hdr + 216, bh.hcrc);
+        memcpy(hdr + 224, base_name(o->base), strlen(base_name(o->base)));
+    }
     put32(hdr + 508, (u32)crc32(0, hdr, 508));
     if (!o->resume) img_write(&m, hdr, HDR_SIZE);
 
@@ -904,6 +1118,9 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
         bc.m = &m;
         bc.o = o;
         bc.idx = ixraw;
+        if (!o->resume) hashes = bc.hashes = xalloc((size_t)nchunks * 8); /* retomado: sem tabela */
+        bc.pix = pix;
+        bc.phash = phash;
         bc.used = ri.used;
         bc.nfree = ri.nfree;
         pipe_init(&pp, nchunks - ri.k, d.size);
@@ -930,6 +1147,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
         used = bc.used;
         bad = bc.bad;
         nfree = bc.nfree;
+        same = bc.same;
         g_last_rfails = bc.rfails;
     }
 
@@ -941,8 +1159,11 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     put64(ftr + 32, bad);
     put32(ftr + 44, (u32)crc32(0, ftr, 44));
     img_write(&m, ftr, FTR_SIZE);
-    img_write_index(&m, ixraw, nchunks);
+    img_write_index(&m, ixraw, nchunks, hashes);
     xfree(ixraw);
+    xfree(hashes);
+    free(pix);
+    free(phash);
     img_finish(&m);
     unlock_all();
     vss_end(1);
@@ -954,6 +1175,11 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     printf("  Disco: %s   Imagem: %s (%.1f%% do disco)   Partes: %d\n", s1, s2,
            100.0 * (double)m.total / (double)d.size, m.part);
     if (nfree) printf("  Blocos de espaco livre ignorados: %llu MB\n", (unsigned long long)nfree);
+    if (o->base) {
+        fmt_size(same, s1);
+        fmt_size(used > same ? used - same : 0, s2);
+        printf("  Incremental: %s iguais a imagem base (nao gravados), %s alterados\n", s1, s2);
+    }
     if (bad) printf("  ATENCAO: %llu setores ilegiveis (ou pulados em area ruim) foram gravados como zero!\n"
                     "  %llu tentativas de leitura falharam.\n", (unsigned long long)bad, (unsigned long long)g_last_rfails);
 #ifndef _WIN32

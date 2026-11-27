@@ -72,6 +72,10 @@
 #define CH_RAW 2
 #define CH_FREE 3
 #define CH_ZSTD 4   /* comprimido com zstd (imagens versao 2) */
+#define CH_SAME 5   /* igual ao bloco da imagem base (imagens incrementais, versao 3) */
+#define HF_SMART 1  /* flags do cabecalho */
+#define HF_VSS 2
+#define HF_INCR 4
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -88,6 +92,41 @@ static u32 le32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] 
 static u64 le64(const u8 *p) { return (u64)le32(p) | ((u64)le32(p + 4) << 32); }
 static void put32(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
 static void put64(u8 *p, u64 v) { put32(p, (u32)v); put32(p + 4, (u32)(v >> 32)); }
+
+/* XXH64 (algoritmo publico de Yann Collet): soma de 64 bits por bloco, usada no backup
+   incremental junto com o CRC32 para saber se um bloco mudou */
+#define XP1 0x9E3779B185EBCA87ull
+#define XP2 0xC2B2AE3D27D4EB4Full
+#define XP3 0x165667B19E3779F9ull
+#define XP4 0x85EBCA77C2B2AE63ull
+#define XP5 0x27D4EB2F165667C5ull
+static u64 xrotl(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
+static u64 xround(u64 a, u64 in) { a += in * XP2; a = xrotl(a, 31); return a * XP1; }
+static u64 xmerge(u64 a, u64 v) { a ^= xround(0, v); return a * XP1 + XP4; }
+static u64 hash64(const u8 *p, size_t len)
+{
+    const u8 *end = p + len;
+    u64 h;
+    if (len >= 32) {
+        u64 v1 = XP1 + XP2, v2 = XP2, v3 = 0, v4 = 0 - XP1;
+        const u8 *lim = end - 32;
+        do {
+            v1 = xround(v1, le64(p)); v2 = xround(v2, le64(p + 8));
+            v3 = xround(v3, le64(p + 16)); v4 = xround(v4, le64(p + 24));
+            p += 32;
+        } while (p <= lim);
+        h = xrotl(v1, 1) + xrotl(v2, 7) + xrotl(v3, 12) + xrotl(v4, 18);
+        h = xmerge(h, v1); h = xmerge(h, v2); h = xmerge(h, v3); h = xmerge(h, v4);
+    } else {
+        h = XP5;
+    }
+    h += (u64)len;
+    for (; p + 8 <= end; p += 8) { h ^= xround(0, le64(p)); h = xrotl(h, 27) * XP1 + XP4; }
+    if (p + 4 <= end) { h ^= (u64)le32(p) * XP1; h = xrotl(h, 23) * XP2 + XP3; p += 4; }
+    for (; p < end; p++) { h ^= (u64)*p * XP5; h = xrotl(h, 11) * XP1; }
+    h ^= h >> 33; h *= XP2; h ^= h >> 29; h *= XP3; h ^= h >> 32;
+    return h;
+}
 
 /* registro de recursos: permite liberar tudo se a operacao for abortada
    (na interface grafica um erro encerra so a operacao, nao o programa) */

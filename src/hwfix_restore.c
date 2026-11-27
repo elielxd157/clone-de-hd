@@ -304,6 +304,7 @@ typedef struct {
     u64 limit;
     u8 *zeros;
     ZSTD_DCtx *zd[8];
+    ImgSrc *parent; /* incremental: imagem base */
 } RsCtx;
 
 static int rs_produce(Pipe *p, Slot *sl)
@@ -322,7 +323,8 @@ static int rs_produce(Pipe *p, Slot *sl)
     sl->type = ch[0];
     sl->stored = le32(ch + 1);
     sl->crc = le32(ch + 5);
-    if (sl->type > CH_ZSTD || (sl->type == CH_RAW && sl->stored != sl->len) || sl->stored > CBUF_SIZE) {
+    if (sl->type > CH_SAME || (sl->type == CH_RAW && sl->stored != sl->len) || sl->stored > CBUF_SIZE ||
+        (sl->type == CH_SAME && (!c->parent || sl->stored))) {
         snprintf(msg, sizeof(msg), "bloco %llu invalido (imagem corrompida)", (unsigned long long)sl->idx);
         pipe_fail(p, msg);
         return -1;
@@ -331,6 +333,16 @@ static int rs_produce(Pipe *p, Slot *sl)
         img_read(c->m, sl->cbuf, sl->stored) != 0) {
         pipe_fail(p, "imagem corrompida/incompleta (falta alguma parte?)");
         return -1;
+    }
+    if (sl->type == CH_SAME) { /* bloco igual ao da imagem base */
+        u8 *b = imgsrc_chunk(c->parent, sl->idx);
+        if (!b) {
+            snprintf(msg, sizeof(msg), "a imagem base esta corrompida ou incompleta (bloco %llu)",
+                     (unsigned long long)sl->idx);
+            pipe_fail(p, msg);
+            return -1;
+        }
+        memcpy(sl->buf, b, sl->len);
     }
     return 0;
 }
@@ -343,6 +355,7 @@ static int rs_work(Pipe *p, Slot *sl, int w)
     case CH_ZERO: sl->out = c->zeros; return 0;
     case CH_FREE: sl->out = c->o->zero_free ? c->zeros : NULL; return 0;
     case CH_RAW: sl->out = sl->cbuf; break;
+    case CH_SAME: sl->out = sl->buf; break;
     case CH_ZSTD:
         if (ZSTD_decompressDCtx(c->zd[w], sl->buf, CHUNK_SIZE, sl->cbuf, sl->stored) != sl->len) goto bad;
         sl->out = sl->buf;
@@ -386,8 +399,16 @@ static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m, u64
     Pipe pp;
     RsCtx rc;
     int k, r;
-    (void)path;
     memset(&rc, 0, sizeof(rc));
+    if (h->flags & HF_INCR) {
+        char pp[700];
+        check_chain(path, h);
+        sibling_path(path, h->pname, pp, sizeof(pp));
+        printf("  Imagem incremental: os blocos que nao mudaram vem de %s\n", h->pname);
+        rc.parent = calloc(1, sizeof(ImgSrc));
+        if (!rc.parent) die("memoria insuficiente");
+        imgsrc_init(rc.parent, pp, 1);
+    }
     rc.m = m;
     rc.d = d;
     rc.o = o;
@@ -404,6 +425,7 @@ static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m, u64
     for (k = 0; k < pp.N; k++) ZSTD_freeDCtx(rc.zd[k]);
     pipe_free(&pp);
     xfree(rc.zeros);
+    if (rc.parent) { imgsrc_close_s(rc.parent); free(rc.parent); }
     if (r != 0) die(pp.err);
     if (img_read(m, ftr, FTR_SIZE) != 0 || memcmp(ftr, "HDCEND", 6) != 0 ||
         le32(ftr + 44) != (u32)crc32(0, ftr, 44))
