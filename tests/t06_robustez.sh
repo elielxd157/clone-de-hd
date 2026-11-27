@@ -10,7 +10,10 @@ rm -f r.img; $HD restore b.hdc r.img -y >/dev/null 2>&1
 check "setores bons fora da zona ruim preservados" bash -c "cmp <(head -c 100000000 src.img) <(head -c 100000000 r.img)"
 # retomada: interrompe com kill -9 e continua
 head -c 150M /dev/urandom | base64 -w 0 > txt.img; truncate -s 200M txt.img
-(HDCLONE_THREADS=1 $HD backup txt.img i.hdc --raw -c 19 -s 0 >/dev/null 2>&1 &); sleep 15; pkill -9 -f "hdclone backup txt.img"; sleep 1
+# interrompe quando ja houver 8 MB gravados (nao depende da velocidade da maquina)
+(HDCLONE_THREADS=1 $HD backup txt.img i.hdc --raw -c 19 -s 0 >/dev/null 2>&1 &)
+for k in $(seq 1 240); do [ "$(stat -c %s i.hdc 2>/dev/null || echo 0)" -ge 8388608 ] && break; sleep 0.5; done
+pkill -9 -f "hdclone backup txt.img"; sleep 1
 $HD backup txt.img i.hdc --raw -s 0 -c 19 --resume > o.txt 2>&1
 check "retomada: continuou de onde parou" grep -q "ja estao na imagem" o.txt
 check "retomada: imagem vazia recomeca do zero" bash -c "rm -f e.hdc*; : > e.hdc; $HD backup src.img e.hdc --raw -s 0 --resume 2>&1 | grep -q 'comecando do inicio' && $HD verify e.hdc | grep -q 'Imagem OK'"
