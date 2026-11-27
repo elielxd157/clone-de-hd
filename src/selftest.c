@@ -730,26 +730,39 @@ static void st_resume(void)
 
 static void st_speed(void)
 {
+    /* dados parecidos com um disco real: metade "texto" (palavras sorteadas,
+       comprime ~3x) e metade aleatoria (fotos/videos, nao comprime) */
+    static const char *w[] = {"arquivo ", "sistema ", "windows ", "dados ", "backup ", "disco ", "usuario ",
+                              "documento ", "pasta ", "programa ", "relatorio ", "imagem ", "versao ", "\r\n"};
     u8 *src = malloc(16 * CHUNK_SIZE), *dst = malloc(CBUF_SIZE);
     ZSTD_CCtx *cc = ZSTD_createCCtx();
-    u64 t0, t1, in = 0, out = 0;
+    u64 t0, el, in = 0, out = 0, o;
     int i;
     if (!src || !dst || !cc) { st_res(2, "sem memoria para medir"); free(src); free(dst); ZSTD_freeCCtx(cc); return; }
-    st_make_contents();
-    for (i = 0; i < 16; i++) { /* metade texto, metade dados aleatorios */
-        if (i & 1) st_noise(src + (u64)i * CHUNK_SIZE, CHUNK_SIZE, 99 + i);
-        else memcpy(src + (u64)i * CHUNK_SIZE, g_f1, CHUNK_SIZE < g_f1n ? CHUNK_SIZE : g_f1n);
-    }
-    t0 = now_ms();
+    g_st_seed = 4242;
     for (i = 0; i < 16; i++) {
-        size_t r = ZSTD_compressCCtx(cc, dst, CBUF_SIZE, src + (u64)i * CHUNK_SIZE, CHUNK_SIZE, 3);
-        in += CHUNK_SIZE;
-        out += ZSTD_isError(r) ? CHUNK_SIZE : r;
+        u8 *c = src + (u64)i * CHUNK_SIZE;
+        if (i & 1) { st_noise(c, CHUNK_SIZE, 99 + i); continue; }
+        for (o = 0; o < CHUNK_SIZE;) {
+            const char *x = w[st_rnd() % 14];
+            size_t n = strlen(x);
+            if (o + n > CHUNK_SIZE) n = CHUNK_SIZE - o;
+            memcpy(c + o, x, n);
+            o += n;
+        }
     }
-    t1 = now_ms();
-    if (t1 == t0) t1 = t0 + 1;
-    st_res(0, "compressao zstd nivel 3: %.0f MB/s por nucleo (x %d nucleos no backup)",
-           (double)in / 1048576.0 / ((double)(t1 - t0) / 1000.0), ncores());
+    /* repete ate somar pelo menos 0,5 s (o relogio do Windows avanca de ~16 em ~16 ms) */
+    t0 = now_ms();
+    do {
+        for (i = 0; i < 16; i++) {
+            size_t r = ZSTD_compressCCtx(cc, dst, CBUF_SIZE, src + (u64)i * CHUNK_SIZE, CHUNK_SIZE, 3);
+            in += CHUNK_SIZE;
+            out += ZSTD_isError(r) ? CHUNK_SIZE : r;
+        }
+        el = now_ms() - t0;
+    } while (el < 500);
+    st_res(0, "compressao zstd nivel 3: %.0f MB/s por nucleo, dados reduzidos a %.0f%% (x %d nucleos no backup)",
+           (double)in / 1048576.0 / ((double)el / 1000.0), 100.0 * (double)out / (double)in, ncores());
     ZSTD_freeCCtx(cc);
     free(src);
     free(dst);
