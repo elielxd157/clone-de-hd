@@ -1,0 +1,6 @@
+hdclone
+*.o
+*.hdc
+*.hdc.*
+*.o
+hdclone-win.zip

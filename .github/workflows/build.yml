@@ -1,0 +1,39 @@
+# Compila os executaveis do Windows (XP ate 11), confere a compatibilidade com o XP
+# e roda a bateria de testes a cada alteracao.
+name: build-e-testes
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 libz-mingw-w64-dev zlib1g-dev \
+            ntfs-3g dosfstools mtools fdisk gdisk libhivex-bin e2fsprogs exfatprogs exfat-fuse
+
+      - name: Compilar (Windows 32/64 bits e Linux)
+        run: make all linux
+
+      - name: Conferir compatibilidade com o Windows XP
+        run: |
+          if i686-w64-mingw32-objdump -p hdclone.exe hdclone-gui.exe | \
+             grep -iE "ConditionVariable|SRWLock|GetTickCount64|InitOnce|FlsAlloc"; then
+            echo "ERRO: funcao que so existe no Vista ou mais novo"; exit 1
+          fi
+
+      - name: Testes
+        run: sudo -E make test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hdclone-windows
+          path: |
+            hdclone.exe
+            hdclone-gui.exe
+            hdclone64.exe
+            hdclone-gui64.exe
+            README.md
