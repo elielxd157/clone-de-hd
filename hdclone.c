@@ -41,6 +41,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <winioctl.h>
+#include <objbase.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -188,12 +189,30 @@ static int all_zero(const u8 *p, u32 n)
 /* acesso a disco / arquivo                                            */
 /* ------------------------------------------------------------------ */
 
+/* VSS: faixas do disco que devem ser lidas de um snapshot em vez do disco */
+#ifdef _WIN32
+typedef HANDLE fh_t;
+#else
+typedef int fh_t; /* no Linux: usado so pelos testes (HDCLONE_TEST_SNAP) */
+#define MAX_PATH 260
+#endif
+typedef struct {
+    u64 start, len;  /* posicao do volume no disco */
+    fh_t h;          /* dispositivo do snapshot (\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN) */
+    char vol[MAX_PATH]; /* nome do volume (\\?\Volume{...}, sem barra final) */
+    char label[64];
+} SnapMap;
+#define MAX_SNAPS 32
+static SnapMap g_snap[MAX_SNAPS];
+static int g_nsnap;
+
 typedef struct {
 #ifdef _WIN32
     HANDLE h;
 #else
     int fd;
 #endif
+    int use_snap; /* leituras redirecionadas para os snapshots VSS */
     int is_device;
     int disknum; /* Windows: numero do PhysicalDrive, -1 se arquivo */
     u64 size;
@@ -282,24 +301,59 @@ static void dev_close(Dev *d)
 #endif
 }
 
-static int dev_pread(Dev *d, void *buf, u32 len, u64 off)
+static int h_pread(fh_t h, void *buf, u32 len, u64 off)
 {
 #ifdef _WIN32
     LARGE_INTEGER li;
     DWORD got = 0;
     li.QuadPart = (LONGLONG)off;
-    if (!SetFilePointerEx(d->h, li, NULL, FILE_BEGIN)) return -1;
-    if (!ReadFile(d->h, buf, len, &got, NULL) || got != len) return -1;
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) return -1;
+    if (!ReadFile(h, buf, len, &got, NULL) || got != len) return -1;
     return 0;
 #else
     u8 *p = buf;
     while (len) {
-        ssize_t r = pread(d->fd, p, len, (off_t)off);
+        ssize_t r = pread(h, p, len, (off_t)off);
         if (r <= 0) return -1;
         p += r; off += (u64)r; len -= (u32)r;
     }
     return 0;
 #endif
+}
+
+static int dev_pread(Dev *d, void *buf, u32 len, u64 off)
+{
+    u8 *p = buf;
+#ifdef _WIN32
+    if (!d->use_snap || !g_nsnap) return h_pread(d->h, buf, len, off);
+#else
+    if (!d->use_snap || !g_nsnap) return h_pread(d->fd, buf, len, off);
+#endif
+    /* divide a leitura: trechos dentro de um volume com snapshot vem do snapshot */
+    while (len) {
+#ifdef _WIN32
+        fh_t h = d->h;
+#else
+        fh_t h = d->fd;
+#endif
+        u64 o = off;
+        u32 n = len;
+        int i;
+        for (i = 0; i < g_nsnap; i++) {
+            SnapMap *sm = &g_snap[i];
+            if (!sm->h) continue;
+            if (off >= sm->start && off < sm->start + sm->len) {
+                h = sm->h;
+                o = off - sm->start;
+                if ((u64)n > sm->start + sm->len - off) n = (u32)(sm->start + sm->len - off);
+                break;
+            }
+            if (sm->start > off && sm->start < off + n) n = (u32)(sm->start - off);
+        }
+        if (h_pread(h, p, n, o) != 0) return -1;
+        p += n; off += n; len -= n;
+    }
+    return 0;
 }
 
 static int dev_pwrite(Dev *d, const void *buf, u32 len, u64 off)
@@ -504,6 +558,12 @@ static int lock_disk_volumes(int disknum, int dismount)
         paths[0] = 0;
         GetVolumePathNamesForVolumeNameA(vol, paths, sizeof(paths), &plen);
         if (n && vol[n - 1] == '\\') vol[n - 1] = 0;
+        {
+            int k, snap = 0;
+            for (k = 0; k < g_nsnap; k++)
+                if (g_snap[k].h && !_stricmp(g_snap[k].vol, vol)) snap = 1;
+            if (snap) continue; /* ja protegido pelo snapshot VSS */
+        }
         h = CreateFileA(vol, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                         NULL, OPEN_EXISTING, 0, NULL);
         if (h == INVALID_HANDLE_VALUE) continue;
@@ -534,6 +594,294 @@ static void unlock_all(void)
         CloseHandle(g_locks[i]);
     }
     g_nlocks = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* VSS (Volume Shadow Copy): copia consistente com o Windows ligado    */
+/* ------------------------------------------------------------------ */
+/*
+ * A interface IVssBackupComponents muda de layout entre o Windows XP e o
+ * Vista+ (mesmo nome, metodos diferentes), por isso os metodos sao chamados
+ * pela posicao na vtable, com uma tabela para cada versao. vssapi.dll e
+ * carregada dinamicamente (no XP a funcao exportada tem outro nome).
+ * Programas de 32 bits nao podem usar VSS no Windows de 64 bits: use as
+ * versoes 64 (o hdclone de 32 bits as chama automaticamente).
+ */
+
+typedef struct {
+    GUID SnapshotId, SnapshotSetId;
+    LONG SnapshotsCount;
+    WCHAR *SnapshotDeviceObject, *OriginalVolumeName, *OriginatingMachine;
+    WCHAR *ServiceMachine, *ExposedName, *ExposedPath;
+    GUID ProviderId;
+    LONG SnapshotAttributes;
+    LONGLONG CreationTimestamp;
+    int Status;
+} VssSnapProp;
+
+typedef struct {
+    int init, setstate, gather, prepare, abort, complete, start, add, doset, props;
+    int wait_arg; /* IVssAsync::Wait recebe timeout (Vista+) ou nada (XP) */
+} VssIdx;
+
+static const VssIdx VSS_XP = {5, 6, 8, 13, 14, 26, 33, 34, 35, 40, 0};
+static const VssIdx VSS_VISTA = {5, 6, 9, 14, 15, 27, 36, 37, 38, 42, 1};
+
+typedef HRESULT(STDMETHODCALLTYPE *vf_bstr)(void *, BSTR);
+typedef HRESULT(STDMETHODCALLTYPE *vf_state)(void *, int, int, int, int);
+typedef HRESULT(STDMETHODCALLTYPE *vf_async)(void *, void **);
+typedef HRESULT(STDMETHODCALLTYPE *vf_void)(void *);
+typedef HRESULT(STDMETHODCALLTYPE *vf_guidp)(void *, GUID *);
+typedef HRESULT(STDMETHODCALLTYPE *vf_add)(void *, WCHAR *, GUID, GUID *);
+typedef HRESULT(STDMETHODCALLTYPE *vf_props)(void *, GUID, VssSnapProp *);
+typedef HRESULT(STDMETHODCALLTYPE *vf_wait)(void *, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE *vf_qs)(void *, HRESULT *, INT *);
+typedef ULONG(STDMETHODCALLTYPE *vf_rel)(void *);
+typedef HRESULT(STDAPICALLTYPE *vf_create)(void **);
+
+#define VM(obj, idx, type) ((type)((*(void ***)(obj))[idx]))
+
+static void *g_vss;
+static const VssIdx *g_vidx;
+static int g_vss_com;
+static char g_vss_note[300]; /* motivo quando o VSS nao pode ser usado */
+
+static int is_wow64(void)
+{
+    typedef BOOL(WINAPI * fw)(HANDLE, PBOOL);
+    BOOL w = FALSE;
+    fw f = (fw)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+    if (f) f(GetCurrentProcess(), &w);
+    return w ? 1 : 0;
+}
+
+/* seguranca COM exigida pelo VSS; deve ser chamada cedo (uma vez por processo) */
+static void vss_security(void)
+{
+    CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+                         RPC_C_IMP_LEVEL_IDENTIFY, NULL, EOAC_NONE, NULL);
+}
+
+static HRESULT vss_wait(void *async)
+{
+    HRESULT hr, res = E_FAIL;
+    if (g_vidx->wait_arg) hr = VM(async, 4, vf_wait)(async, INFINITE);
+    else hr = VM(async, 4, vf_void)(async);
+    if (SUCCEEDED(hr)) {
+        hr = VM(async, 5, vf_qs)(async, &res, NULL);
+        if (SUCCEEDED(hr)) hr = res;
+    }
+    VM(async, 2, vf_rel)(async);
+    return hr;
+}
+
+static const char *vss_errtext(HRESULT hr)
+{
+    switch ((unsigned long)hr) {
+    case 0x80042306: return "o provedor de snapshots esta ocupado; tente de novo";
+    case 0x8004230C: return "volume nao suporta snapshot";
+    case 0x8004230F: return "erro no provedor de snapshots";
+    case 0x80042312: return "limite de snapshots atingido";
+    case 0x80042316: return "ja existe outro snapshot sendo criado; tente de novo em alguns minutos";
+    case 0x80042317: return "limite de snapshots do volume atingido";
+    case 0x8004231F: return "espaco insuficiente para o snapshot (deixe ao menos ~10%% livre no volume)";
+    case 0x80042302: return "componente VSS com problema (servico 'Copias de Sombra de Volume')";
+    case 0x80070005: return "acesso negado (execute como Administrador)";
+    case 0x80070424: return "servico de Copias de Sombra de Volume desativado";
+    default: return "erro do VSS";
+    }
+}
+
+static void vss_end(int ok)
+{
+    int i;
+    for (i = 0; i < g_nsnap; i++)
+        if (g_snap[i].h) { CloseHandle(g_snap[i].h); g_snap[i].h = NULL; }
+    g_nsnap = 0;
+    if (g_vss) {
+        void *a = NULL;
+        if (ok && SUCCEEDED(VM(g_vss, g_vidx->complete, vf_async)(g_vss, &a)) && a) vss_wait(a);
+        else if (!ok) VM(g_vss, g_vidx->abort, vf_void)(g_vss);
+        VM(g_vss, 2, vf_rel)(g_vss); /* libera: snapshots temporarios sao apagados */
+        g_vss = NULL;
+    }
+    if (g_vss_com) { CoUninitialize(); g_vss_com = 0; }
+}
+
+#define VSS_FAIL(what, hr)                                                                  \
+    do {                                                                                    \
+        sprintf(g_vss_note, "%s: %s (0x%08lX)", what, vss_errtext(hr), (unsigned long)(hr)); \
+        vss_end(0);                                                                         \
+        return -1;                                                                          \
+    } while (0)
+
+/* cria snapshots de todos os volumes do disco; 0 = ok, -1 = nao foi possivel */
+static int vss_begin(int disknum)
+{
+    OSVERSIONINFOA ov;
+    HMODULE dll;
+    vf_create create;
+    HRESULT hr;
+    void *a = NULL;
+    GUID setid, snapid[MAX_SNAPS];
+    char vol[MAX_PATH];
+    HANDLE fv;
+    int i, n = 0;
+
+    g_vss_note[0] = 0;
+    g_nsnap = 0;
+    memset(&ov, 0, sizeof(ov));
+    ov.dwOSVersionInfoSize = sizeof(ov);
+    GetVersionExA(&ov);
+    if (ov.dwMajorVersion == 5 && ov.dwMinorVersion == 1) g_vidx = &VSS_XP;
+    else if (ov.dwMajorVersion >= 6) g_vidx = &VSS_VISTA;
+    else { strcpy(g_vss_note, "VSS nao suportado nesta versao do Windows"); return -1; }
+    if (is_wow64()) {
+        strcpy(g_vss_note, "Windows de 64 bits: o VSS exige a versao 64 bits (hdclone64.exe / hdclone-gui64.exe)");
+        return -1;
+    }
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) g_vss_com = 1;
+    vss_security();
+
+    dll = LoadLibraryA("vssapi.dll");
+    if (!dll) { strcpy(g_vss_note, "vssapi.dll nao encontrada"); vss_end(0); return -1; }
+    create = (vf_create)(void *)GetProcAddress(dll, "CreateVssBackupComponentsInternal");
+#ifdef _WIN64
+    if (!create) create = (vf_create)(void *)GetProcAddress(dll, "?CreateVssBackupComponents@@YAJPEAPEAVIVssBackupComponents@@@Z");
+#else
+    if (!create) create = (vf_create)(void *)GetProcAddress(dll, "?CreateVssBackupComponents@@YGJPAPAVIVssBackupComponents@@@Z");
+#endif
+    if (!create) { strcpy(g_vss_note, "funcao VSS nao encontrada em vssapi.dll"); vss_end(0); return -1; }
+
+    printf("  Iniciando VSS (copia de sombra)...\n");
+    hr = create(&g_vss);
+    if (FAILED(hr) || !g_vss) { g_vss = NULL; VSS_FAIL("CreateVssBackupComponents", hr); }
+    hr = VM(g_vss, g_vidx->init, vf_bstr)(g_vss, NULL);
+    if (FAILED(hr)) VSS_FAIL("InitializeForBackup", hr);
+    /* VSS_BT_COPY (5): nao interfere no historico de backups de SQL/Exchange etc. */
+    hr = VM(g_vss, g_vidx->setstate, vf_state)(g_vss, 0, 0, 5, 0);
+    if (FAILED(hr)) VSS_FAIL("SetBackupState", hr);
+    hr = VM(g_vss, g_vidx->gather, vf_async)(g_vss, &a);
+    if (FAILED(hr) || FAILED(hr = vss_wait(a))) VSS_FAIL("GatherWriterMetadata", hr);
+    hr = VM(g_vss, g_vidx->start, vf_guidp)(g_vss, &setid);
+    if (FAILED(hr)) VSS_FAIL("StartSnapshotSet", hr);
+
+    /* adiciona cada volume que fica neste disco */
+    fv = FindFirstVolumeA(vol, MAX_PATH);
+    if (fv != INVALID_HANDLE_VALUE) {
+        do {
+            char paths[256] = "";
+            DWORD plen = 0;
+            u8 buf[2048];
+            DWORD br;
+            HANDLE h;
+            VOLUME_DISK_EXTENTS *e = (VOLUME_DISK_EXTENTS *)buf;
+            WCHAR wvol[MAX_PATH];
+            size_t l = strlen(vol);
+            if (n >= MAX_SNAPS) break;
+            GetVolumePathNamesForVolumeNameA(vol, paths, sizeof(paths), &plen);
+            if (l && vol[l - 1] == '\\') vol[l - 1] = 0;
+            h = CreateFileA(vol, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            if (!DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, buf, sizeof(buf), &br, NULL) ||
+                e->NumberOfDiskExtents < 1 || (int)e->Extents[0].DiskNumber != disknum) {
+                CloseHandle(h);
+                continue;
+            }
+            CloseHandle(h);
+            if (e->NumberOfDiskExtents != 1) {
+                printf("  Volume %s ocupa mais de um disco: lido direto, sem snapshot\n", paths[0] ? paths : vol);
+                continue;
+            }
+            strcat(vol, "\\");
+            MultiByteToWideChar(CP_ACP, 0, vol, -1, wvol, MAX_PATH);
+            vol[strlen(vol) - 1] = 0;
+            {
+                GUID nullid;
+                memset(&nullid, 0, sizeof(nullid));
+                hr = VM(g_vss, g_vidx->add, vf_add)(g_vss, wvol, nullid, &snapid[n]);
+            }
+            if (FAILED(hr)) {
+                printf("  Volume %s: sem snapshot (%s), sera lido direto\n", paths[0] ? paths : "(sem letra)",
+                       (unsigned long)hr == 0x8004230C ? "FAT/sistema de arquivos nao suportado" : vss_errtext(hr));
+                continue;
+            }
+            g_snap[n].start = (u64)e->Extents[0].StartingOffset.QuadPart;
+            g_snap[n].len = (u64)e->Extents[0].ExtentLength.QuadPart;
+            g_snap[n].h = NULL;
+            snprintf(g_snap[n].vol, sizeof(g_snap[n].vol), "%s", vol);
+            snprintf(g_snap[n].label, sizeof(g_snap[n].label), "%s", paths[0] ? paths : "(sem letra)");
+            n++;
+        } while (FindNextVolumeA(fv, vol, MAX_PATH));
+        FindVolumeClose(fv);
+    }
+    if (!n) { strcpy(g_vss_note, "nenhum volume deste disco suporta snapshot"); vss_end(0); return -1; }
+
+    hr = VM(g_vss, g_vidx->prepare, vf_async)(g_vss, &a);
+    if (FAILED(hr) || FAILED(hr = vss_wait(a))) VSS_FAIL("PrepareForBackup", hr);
+    printf("  Criando snapshot (pode levar ate um minuto)...\n");
+    hr = VM(g_vss, g_vidx->doset, vf_async)(g_vss, &a);
+    if (FAILED(hr) || FAILED(hr = vss_wait(a))) VSS_FAIL("DoSnapshotSet", hr);
+
+    g_nsnap = n;
+    for (i = 0; i < n; i++) {
+        VssSnapProp sp;
+        memset(&sp, 0, sizeof(sp));
+        hr = VM(g_vss, g_vidx->props, vf_props)(g_vss, snapid[i], &sp);
+        if (FAILED(hr) || !sp.SnapshotDeviceObject) VSS_FAIL("GetSnapshotProperties", hr);
+        g_snap[i].h = CreateFileW(sp.SnapshotDeviceObject, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  NULL, OPEN_EXISTING, 0, NULL);
+        CoTaskMemFree(sp.SnapshotDeviceObject);
+        CoTaskMemFree(sp.OriginalVolumeName);
+        CoTaskMemFree(sp.OriginatingMachine);
+        CoTaskMemFree(sp.ServiceMachine);
+        CoTaskMemFree(sp.ExposedName);
+        CoTaskMemFree(sp.ExposedPath);
+        if (g_snap[i].h == INVALID_HANDLE_VALUE) {
+            g_snap[i].h = NULL;
+            VSS_FAIL("abrir snapshot", (HRESULT)HRESULT_FROM_WIN32(GetLastError()));
+        }
+        printf("  Snapshot do volume %s criado\n", g_snap[i].label);
+    }
+    return 0;
+}
+
+/* No Windows 64 bits, o executavel de 32 bits passa a execucao para a versao
+   64 bits (exe64, na mesma pasta), necessaria para o VSS. 0 = relancado. */
+static int relaunch_64(const char *exe64, int wait, DWORD *code)
+{
+    WCHAR path[MAX_PATH], w64[64], *cl, *cmd, *p;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    if (!is_wow64()) return -1;
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return -1;
+    p = wcsrchr(path, L'\\');
+    if (!p) return -1;
+    MultiByteToWideChar(CP_ACP, 0, exe64, -1, w64, 64);
+    wcscpy(p + 1, w64);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return -1;
+    cl = GetCommandLineW(); /* repassa os argumentos (tudo depois do nome do programa) */
+    if (*cl == L'"') { cl++; while (*cl && *cl != L'"') cl++; if (*cl) cl++; }
+    else while (*cl && *cl != L' ' && *cl != L'\t') cl++;
+    cmd = malloc((wcslen(path) + wcslen(cl) + 4) * sizeof(WCHAR));
+    if (!cmd) return -1;
+    wcscpy(cmd, L"\"");
+    wcscat(cmd, path);
+    wcscat(cmd, L"\"");
+    wcscat(cmd, cl);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(path, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { free(cmd); return -1; }
+    free(cmd);
+    if (wait) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        GetExitCodeProcess(pi.hProcess, code);
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return 0;
 }
 
 /* numero do disco fisico onde fica um caminho (arquivo/pasta), -1 se desconhecido */
@@ -655,6 +1003,37 @@ static void cmd_list(void)
 static int lock_disk_volumes(int disknum, int dismount) { (void)disknum; (void)dismount; return 0; }
 static void unlock_all(void) {}
 static int path_disk(const char *p) { (void)p; return -1; }
+/* Linux: simula snapshots para testar o redirecionamento de leitura.
+   HDCLONE_TEST_SNAP="inicio_bytes:tamanho_bytes:arquivo[,...]" */
+static int vss_begin(int disknum)
+{
+    const char *e = getenv("HDCLONE_TEST_SNAP");
+    (void)disknum;
+    g_nsnap = 0;
+    while (e && *e && g_nsnap < MAX_SNAPS) {
+        char f[512];
+        unsigned long long st, ln;
+        int used = 0;
+        if (sscanf(e, "%llu:%llu:%511[^,]%n", &st, &ln, f, &used) != 3) break;
+        g_snap[g_nsnap].start = st;
+        g_snap[g_nsnap].len = ln;
+        g_snap[g_nsnap].h = open(f, O_RDONLY);
+        if (g_snap[g_nsnap].h < 0) return -1;
+        printf("  [teste] snapshot simulado em %llu (+%llu): %s\n", st, ln, f);
+        g_nsnap++;
+        e += used;
+        if (*e == ',') e++;
+    }
+    return g_nsnap ? 0 : -1;
+}
+static void vss_end(int ok)
+{
+    int i;
+    (void)ok;
+    for (i = 0; i < g_nsnap; i++) close(g_snap[i].h);
+    g_nsnap = 0;
+}
+static char g_vss_note[300];
 static void cmd_list(void)
 {
     printf("No Linux, use o caminho do dispositivo (ex.: /dev/sdb) ou um arquivo .img.\n"
@@ -691,6 +1070,7 @@ static void cleanup_all(void)
 {
     int i;
     unlock_all();
+    vss_end(0);
     for (i = 0; i < MAX_RES; i++) {
         void *p = g_res[i].p;
         if (!p) continue;
@@ -1022,7 +1402,10 @@ typedef struct {
     int yes;
     int force;
     int zero_free;
+    int no_vss;
 } Opts;
+
+static int g_vss_used; /* ultimo backup usou VSS */
 
 static void cmd_backup(const char *src, const char *dst, Opts *o)
 {
@@ -1043,6 +1426,21 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     if (d.disknum >= 0 && path_disk(dst) == d.disknum)
         die("a imagem nao pode ser gravada no mesmo disco que esta sendo copiado");
 
+    g_vss_used = 0;
+#ifdef _WIN32
+    if (d.disknum >= 0 && !o->no_vss) {
+#else
+    if (getenv("HDCLONE_TEST_SNAP") && !o->no_vss) {
+#endif
+        printf("\nVSS (copia consistente com o Windows ligado):\n");
+        if (vss_begin(d.disknum) == 0) {
+            d.use_snap = 1;
+            g_vss_used = 1;
+        } else {
+            printf("  AVISO: VSS indisponivel - %s\n", g_vss_note);
+        }
+    }
+
     if (!o->raw) {
         printf("\nAnalisando particoes...\n");
         reset_areas();
@@ -1052,7 +1450,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     }
 
     if (d.disknum >= 0) {
-        printf("\nBloqueando volumes da origem...\n");
+        printf("\nBloqueando volumes sem snapshot...\n");
         if (lock_disk_volumes(d.disknum, 0) > 0)
             printf("  AVISO: ha volumes em uso. Arquivos abertos podem ficar inconsistentes na imagem.\n"
                    "  Para um clone 100%% consistente do disco do Windows, rode o hdclone a partir\n"
@@ -1067,7 +1465,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     put32(hdr + 8, 1);
     put32(hdr + 12, d.sector);
     put32(hdr + 16, CHUNK_SIZE);
-    put32(hdr + 20, o->raw ? 0 : 1);
+    put32(hdr + 20, (o->raw ? 0 : 1) | (g_vss_used ? 2 : 0));
     put64(hdr + 24, d.size);
     put64(hdr + 32, nchunks);
     put64(hdr + 40, (u64)time(NULL));
@@ -1154,6 +1552,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     img_write(&m, ftr, FTR_SIZE);
     img_close_part(&m);
     unlock_all();
+    vss_end(1);
     dev_close(&d);
 
     fmt_size(d.size, s1);
@@ -1163,6 +1562,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
            100.0 * (double)m.total / (double)d.size, m.part);
     if (nfree) printf("  Blocos de espaco livre ignorados: %llu MB\n", (unsigned long long)nfree);
     if (bad) printf("  ATENCAO: %llu setores ilegiveis foram preenchidos com zeros!\n", (unsigned long long)bad);
+    if (g_vss_used) printf("  Copia consistente feita via VSS (snapshots temporarios ja removidos).\n");
     xfree(buf);
     xfree(cbuf);
     reset_areas();
@@ -1207,7 +1607,8 @@ static void print_header(Hdr *h)
     printf("  Disco original : %s (%llu bytes, setor %u)\n", s, (unsigned long long)h->size, h->sector);
     printf("  Origem         : %s\n", h->src);
     printf("  Criada em      : %s  com %s\n", t, h->tool);
-    printf("  Modo           : %s\n", (h->flags & 1) ? "inteligente (somente dados usados)" : "setor a setor");
+    printf("  Modo           : %s%s\n", (h->flags & 1) ? "inteligente (somente dados usados)" : "setor a setor",
+           (h->flags & 2) ? ", copia consistente via VSS" : "");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1454,6 +1855,8 @@ static void usage(void)
         "  -s MB        dividir a imagem em partes de MB megabytes. Padrao: 4000\n"
         "               (cabe em pendrive FAT32). Use -s 0 para arquivo unico.\n"
         "  --raw        copia setor a setor, inclusive espaco livre\n"
+        "  --no-vss     nao usar VSS (copia de sombra). Por padrao o VSS e usado para\n"
+        "               copiar o disco com o Windows ligado de forma consistente.\n"
         "Opcoes de restore:\n"
         "  -y           nao pedir confirmacao\n"
         "  --zero-free  grava zeros no espaco livre (mais lento, apaga dados antigos)\n"
@@ -1461,8 +1864,8 @@ static void usage(void)
         "Exemplos:\n"
         "  hdclone backup 1 E:\\backup\\pc-sala.hdc\n"
         "  hdclone restore E:\\backup\\pc-sala.hdc 2\n\n"
-        "Execute como Administrador. Ao clonar o disco do Windows em uso, prefira\n"
-        "iniciar por WinPE/Hiren's BootCD PE ou ligar o HD em outro computador.\n");
+        "Execute como Administrador. O disco do Windows em uso e copiado de forma\n"
+        "consistente via VSS (Windows 64 bits: deixe o hdclone64.exe na mesma pasta).\n");
 }
 
 static void read_line(const char *prompt, char *out, int n)
@@ -1517,6 +1920,12 @@ int main(int argc, char **argv)
     memset(&o, 0, sizeof(o));
     o.level = 6;
     o.split = 4000ull * 1024 * 1024;
+#ifdef _WIN32
+    {
+        DWORD code = 1;
+        if (relaunch_64("hdclone64.exe", 1, &code) == 0) return (int)code;
+    }
+#endif
 
     if (argc < 2) {
         interactive(&o);
@@ -1535,6 +1944,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-y")) o.yes = 1;
         else if (!strcmp(argv[i], "--force")) o.force = 1;
         else if (!strcmp(argv[i], "--zero-free")) o.zero_free = 1;
+        else if (!strcmp(argv[i], "--no-vss")) o.no_vss = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help") || !strcmp(argv[i], "/?")) { usage(); return 0; }
         else if (np < 3) pos[np++] = argv[i];
         else { usage(); return 1; }

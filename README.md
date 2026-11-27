@@ -4,7 +4,9 @@ Ferramenta de linha de comando para fazer **backup de um disco inteiro** (todas 
 partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 **restaurar** essa imagem em outro HD.
 
-- Roda do **Windows XP ao Windows 11** (um único `hdclone.exe`, 32 bits, sem DLLs).
+- Roda do **Windows XP ao Windows 11**, sem instalar nada e sem DLLs.
+- **Copia o disco com o Windows ligado** de forma consistente, usando **VSS**
+  (cópias de sombra), sem precisar dar boot por pendrive.
 - **Modo inteligente:** lê o bitmap do NTFS e a FAT do FAT32 e copia só os
   clusters em uso. O resto (outras partições, áreas desconhecidas) é copiado setor
   a setor, então qualquer sistema é preservado.
@@ -12,6 +14,37 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - Divide a imagem em partes de 4000 MB por padrão (cabe em pendrive FAT32).
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
 - Restaurar num disco **maior** funciona (em GPT, a tabela é ajustada sozinha).
+
+## Arquivos — mantenha os quatro na mesma pasta
+
+| Arquivo | Para quê |
+|---|---|
+| `hdclone-gui.exe` | interface gráfica (abra este) |
+| `hdclone.exe` | linha de comando |
+| `hdclone-gui64.exe`, `hdclone64.exe` | versões 64 bits |
+
+No Windows de 64 bits, o VSS só funciona em programas de 64 bits. Por isso o
+`hdclone-gui.exe`/`hdclone.exe` abrem sozinhos a versão 64 bits se ela estiver na
+mesma pasta. Basta sempre abrir o `hdclone-gui.exe`.
+
+## VSS: backup com o Windows ligado
+
+Ao fazer backup, o hdclone cria um *snapshot* (foto instantânea) de cada volume
+do disco e copia a partir dele. A imagem fica exatamente como o disco estava naquele
+instante, mesmo com programas abertos e arquivos mudando durante a cópia. Os
+snapshots são temporários e apagados ao terminar (ou ao cancelar).
+
+- Funciona no XP, Vista, 7, 8, 10 e 11, e no Server 2008 em diante.
+  Não funciona no Server 2003 nem no XP 64 bits; nesses, a cópia é feita sem VSS.
+- Só volumes **NTFS** têm snapshot. Partições FAT32 ou Linux no mesmo disco são
+  lidas direto (o log avisa).
+- Precisa do serviço "Cópias de Sombra de Volume" ativo (padrão do Windows) e de
+  algum espaço livre no volume (uns 10% é seguro).
+- Usa o tipo de backup "cópia", que não mexe no histórico de backups de SQL Server
+  ou Exchange.
+- Se o VSS falhar, o backup continua sem ele e o motivo aparece no log. Na
+  interface, a mensagem final avisa quando o disco do Windows foi copiado sem VSS.
+- Para desligar: desmarque "Usar VSS" ou use `--no-vss`.
 
 ## Interface gráfica — `hdclone-gui.exe`
 
@@ -42,13 +75,13 @@ Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
 Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
-`--zero-free` (zera o espaço livre no destino), `--force`.
+`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--force`.
 
 ## Importante
 
-- **Disco do Windows em uso:** o clone funciona, mas arquivos abertos podem sair
-  inconsistentes. Para um clone perfeito, inicie por um pendrive WinPE /
-  Hiren's BootCD PE (o `hdclone.exe` roda neles) ou ligue o HD em outro PC.
+- **Restaurar** o disco do Windows em uso não é possível (ninguém consegue
+  sobrescrever o sistema que está rodando). Para isso, inicie por um pendrive
+  WinPE / Hiren's BootCD PE e rode o hdclone dele, ou ligue o HD em outro PC.
 - O disco de destino precisa ser **do mesmo tamanho ou maior** que o original.
 - Depois de restaurar em disco maior, use o Gerenciamento de Disco
   ("Estender volume") ou `diskpart` para usar o espaço extra.
@@ -57,5 +90,5 @@ Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0
 
 ## Compilar
 
-Em Linux (Debian/Ubuntu): `apt install gcc-mingw-w64-i686 libz-mingw-w64-dev`, depois
-`make` → `hdclone.exe` e `hdclone-gui.exe`. `make linux` gera uma versão Linux (usada nos testes).
+Em Linux (Debian/Ubuntu): `apt install gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 libz-mingw-w64-dev`,
+depois `make` → os quatro `.exe`. `make linux` gera uma versão Linux (usada nos testes).

@@ -21,7 +21,7 @@ enum {
     ID_MODE_BACKUP = 100, ID_MODE_RESTORE, ID_MODE_VERIFY,
     ID_LBL_DISK, ID_REFRESH, ID_LIST,
     ID_LBL_IMG, ID_PATH, ID_BROWSE, ID_IMGINFO,
-    ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE,
+    ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE, ID_VSS,
     ID_START, ID_CANCEL, ID_PROGRESS, ID_STATUS, ID_LOG, ID_GRP_MODE
 };
 
@@ -49,7 +49,7 @@ typedef struct {
 static HWND g_hwnd, g_list, g_log, g_prog, g_status, g_path, g_imginfo, g_comp;
 static HFONT g_font, g_bold;
 static int g_mode = MODE_BACKUP;
-static int g_running, g_close_after;
+static int g_running, g_close_after, g_job_sysdisk;
 static DiskInfo g_disks[32];
 static int g_ndisks;
 static Job g_job;
@@ -277,6 +277,7 @@ static void set_mode(int m)
     EnableWindow(GetDlgItem(g_hwnd, ID_SPLIT), m == MODE_BACKUP);
     EnableWindow(GetDlgItem(g_hwnd, ID_RAW), m == MODE_BACKUP);
     EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), m == MODE_RESTORE);
+    EnableWindow(GetDlgItem(g_hwnd, ID_VSS), m == MODE_BACKUP);
     SetDlgItemTextW(g_hwnd, ID_START, m == MODE_BACKUP ? L"Iniciar backup"
                                       : m == MODE_RESTORE ? L"Iniciar restauração" : L"Verificar");
     update_imginfo();
@@ -296,6 +297,7 @@ static void set_running(int r)
         EnableWindow(GetDlgItem(g_hwnd, ID_SPLIT), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_RAW), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_VSS), FALSE);
     } else {
         set_mode(g_mode);
         SetWindowTextW(g_hwnd, APP_TITLE);
@@ -364,6 +366,7 @@ static void start(void)
         g_job.o.level = lv[ci < 0 || ci > 2 ? 1 : ci];
         g_job.o.split = IsDlgButtonChecked(g_hwnd, ID_SPLIT) ? 4000ull * 1024 * 1024 : 0;
         g_job.o.raw = IsDlgButtonChecked(g_hwnd, ID_RAW) == BST_CHECKED;
+        g_job.o.no_vss = IsDlgButtonChecked(g_hwnd, ID_VSS) != BST_CHECKED;
         if (!strchr(g_job.path, '.') || strrchr(g_job.path, '.') < strrchr(g_job.path, '\\')) {
             strcat(g_job.path, ".hdc");
         }
@@ -372,13 +375,13 @@ static void start(void)
                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
                 return;
         }
-        if (d->is_system) {
+        g_job_sysdisk = d->is_system;
+        if (d->is_system && g_job.o.no_vss) {
             if (MessageBoxW(g_hwnd,
-                            L"Este é o disco do Windows que está em uso.\n\n"
+                            L"Este é o disco do Windows que está em uso e o VSS está desligado.\n\n"
                             L"A cópia vai funcionar, mas arquivos abertos durante o backup podem "
-                            L"ficar inconsistentes na imagem. Para um clone perfeito, inicie o "
-                            L"computador por um pendrive WinPE / Hiren's BootCD PE ou ligue o HD "
-                            L"em outro computador.\n\nContinuar mesmo assim?",
+                            L"ficar inconsistentes na imagem. Recomendado: marque a opção "
+                            L"\"Usar VSS\".\n\nContinuar mesmo assim?",
                             APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
                 return;
         }
@@ -481,7 +484,7 @@ static void create_controls(void)
     ctl(L"BUTTON", L"Procurar...", BS_PUSHBUTTON | WS_TABSTOP, 530, 240, 100, 24, ID_BROWSE);
     g_imginfo = ctl(L"STATIC", L"", SS_LEFT, 12, 268, 618, 18, ID_IMGINFO);
 
-    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 72, ID_GRP_OPT);
+    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 98, ID_GRP_OPT);
     ctl(L"STATIC", L"Compressão:", SS_LEFT, 24, 312, 80, 18, ID_LBL_COMP);
     g_comp = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 104, 308, 170, 120, ID_COMP);
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Rápida (arquivo maior)");
@@ -492,13 +495,16 @@ static void create_controls(void)
     CheckDlgButton(g_hwnd, ID_SPLIT, BST_CHECKED);
     ctl(L"BUTTON", L"Copiar setor a setor (inclui espaço livre, imagem maior)", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 336, 330, 20, ID_RAW);
     ctl(L"BUTTON", L"Zerar espaço livre no destino", BS_AUTOCHECKBOX | WS_TABSTOP, 400, 336, 220, 20, ID_ZEROFREE);
+    ctl(L"BUTTON", L"Usar VSS: copiar com o Windows ligado de forma consistente (recomendado)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 24, 362, 590, 20, ID_VSS);
+    CheckDlgButton(g_hwnd, ID_VSS, BST_CHECKED);
 
-    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 372, 160, 30, ID_START);
-    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 372, 100, 30, ID_CANCEL);
-    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 379, 338, 20, ID_STATUS);
-    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 410, 620, 20, ID_PROGRESS);
+    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 398, 160, 30, ID_START);
+    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 398, 100, 30, ID_CANCEL);
+    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 405, 338, 20, ID_STATUS);
+    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 436, 620, 20, ID_PROGRESS);
     SendMessageW(g_prog, PBM_SETRANGE32, 0, 1000);
-    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 438, 620, 150, ID_LOG);
+    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 464, 620, 150, ID_LOG);
     SendMessageW(g_log, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
 
     EnumChildWindows(g_hwnd, set_font_cb, (LPARAM)g_font);
@@ -564,9 +570,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (ok) {
             SendMessageW(g_prog, PBM_SETPOS, 1000, 0);
             SetWindowTextW(g_status, L"Concluído com sucesso.");
-            if (!g_close_after)
-                msgbox(mode == MODE_BACKUP ? L"Backup concluído com sucesso!\n\nDica: use \"Verificar imagem\" "
-                                             L"para conferir o arquivo antes de precisar dele."
+            if (!g_close_after && mode == MODE_BACKUP && !g_vss_used && g_job_sysdisk) {
+                wchar_t t[900], note[300];
+                MultiByteToWideChar(CP_ACP, 0, g_vss_note[0] ? g_vss_note : "VSS desligado", -1, note, 300);
+                swprintf(t, 900, L"Backup concluído, mas SEM VSS:\n%ls\n\n"
+                                 L"Como este é o disco do Windows em uso, arquivos abertos durante a "
+                                 L"cópia podem estar inconsistentes na imagem.", note);
+                msgbox(t, MB_ICONWARNING);
+            } else if (!g_close_after)
+                msgbox(mode == MODE_BACKUP
+                           ? (g_vss_used ? L"Backup concluído com sucesso!\n\nA cópia foi feita com VSS: a imagem "
+                                           L"é consistente mesmo com o Windows ligado.\n\nDica: use \"Verificar "
+                                           L"imagem\" para conferir o arquivo antes de precisar dele."
+                                         : L"Backup concluído com sucesso!\n\nDica: use \"Verificar imagem\" "
+                                           L"para conferir o arquivo antes de precisar dele.")
                        : mode == MODE_RESTORE ? L"Restauração concluída com sucesso!"
                                               : L"Imagem verificada: está íntegra.",
                        MB_ICONINFORMATION);
@@ -615,6 +632,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
 
+    /* Windows 64 bits: abre a versao 64 bits (necessaria para o VSS), se existir */
+    if (relaunch_64("hdclone-gui64.exe", 0, NULL) == 0) return 0;
+    /* COM na thread da janela + seguranca COM exigida pelo VSS (antes de qualquer dialogo) */
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    vss_security();
+
     dc = GetDC(NULL);
     g_scale = GetDeviceCaps(dc, LOGPIXELSY) / 96.0;
     ReleaseDC(NULL, dc);
@@ -636,7 +659,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpszClassName = L"hdcloneGui";
     RegisterClassW(&wc);
 
-    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(598);
+    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(624);
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     CreateWindowW(L"hdcloneGui", APP_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                   CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
