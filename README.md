@@ -14,7 +14,10 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
   núcleos do processador, com leitura, compressão e gravação acontecendo ao mesmo tempo.
 - Divide a imagem em partes de 4000 MB por padrão (cabe em pendrive FAT32).
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
-- **Recupera arquivos soltos** da imagem (sem restaurar o disco inteiro).
+- **Clona disco para disco** direto, sem imagem intermediária (inclusive para disco menor).
+- **Recupera arquivos soltos** da imagem (NTFS e FAT32), com **busca por nome**.
+- **Prepara o Windows para outro hardware** (evita a tela azul 0x7B), do XP ao 11.
+- **Verificação ao terminar** e relatório **.log** salvo junto da imagem.
 - Deixa de fora `pagefile.sys` e `hiberfil.sys` (o Windows recria): imagem bem menor.
 - Restaura em disco **maior** ou **menor** que o original (em disco menor, a última
   partição é reduzida automaticamente quando os dados cabem).
@@ -71,6 +74,55 @@ novas (zstd) **não abrem em versões antigas do hdclone**; a versão antiga mos
 antigas** ou use `--compat`. Nesse modo, blocos que não comprimem (fotos, vídeos,
 zip) são detectados rapidamente e gravados direto.
 
+## Clonar disco para disco
+
+Modo **Clonar disco** na interface (ou `hdclone clone <origem> <destino>`). Copia
+direto de um disco para outro, sem arquivo de imagem. Tem as mesmas proteções e
+recursos do backup + restauração:
+
+- VSS na origem (clona o disco do Windows ligado);
+- só copia o espaço usado e deixa `pagefile`/`hiberfil` de fora;
+- destino **menor** (reduz a última partição, se couber) ou **maior** (GPT ajustada);
+- opção de verificar (lê o destino de volta e confere bloco a bloco);
+- opção de preparar para outro hardware.
+
+**Depois de clonar:** antes de dar boot pelo disco novo, desligue o PC e
+desconecte o disco antigo. Os dois discos ficam idênticos e o Windows pode se
+confundir com os dois ligados.
+
+## Verificação e relatório (.log)
+
+- **Verificar ao terminar** (`--verify`): ao fim do backup a imagem é lida de volta
+  do disco e cada bloco é conferido. No clone, o disco de destino é relido e
+  comparado.
+- Todo backup grava um **relatório** `imagem.hdc.log` ao lado da imagem: data,
+  origem, partições, opções, tamanho, erros e resultado final.
+
+## Preparar para outro hardware (tela azul 0x7B)
+
+Ao restaurar ou clonar para **outro computador**, o Windows pode dar tela azul
+`0x0000007B INACCESSIBLE_BOOT_DEVICE`: o driver da controladora de disco do PC novo
+não está ativado no boot. A opção **"Preparar p/ outro PC"** (`--hwfix`, ou
+`hdclone hwfix <disco>` para um disco já restaurado) ativa no boot os drivers de
+disco **que já vêm no Windows**, editando o registro do disco de destino:
+
+| Windows | Drivers ativados |
+|---|---|
+| XP / 2000 / 2003 | atapi, intelide, pciide (mesma ideia do MergeIDE) |
+| Vista / 7 | + msahci, iaStorV (recomendação da Microsoft, KB922976) |
+| 8 / 8.1 / 10 / 11 | + storahci, stornvme, e zera o `StartOverride` |
+
+Só são alterados valores que já existem, no próprio lugar. Nenhuma chave é criada,
+e o relatório lista cada alteração. Limites:
+
+- **XP em PC com SATA no modo AHCI:** o XP não tem driver AHCI. Mude no BIOS para
+  **IDE/Compatível**.
+- **Windows 7 com SSD NVMe:** o 7 não tem driver NVMe. Instale a atualização
+  KB2990941 antes do backup, ou use SATA.
+- Drivers de fabricante (RAID, controladoras especiais) não vêm no Windows e
+  continuam precisando ser instalados.
+- A ativação do Windows/Office pode pedir reativação num hardware diferente.
+
 ## Recuperar arquivos da imagem
 
 Para pegar só alguns arquivos ou pastas (ex.: os Documentos de alguém) sem
@@ -87,8 +139,13 @@ restaurar o disco:
   hdclone extract pc.hdc 1 "Users\Ana\Documents" D:\recuperado
   ```
 
-As datas de modificação são preservadas. Funciona com partições **NTFS**,
-inclusive arquivos grandes e fragmentados. Ficam de fora, com aviso:
+**Busca:** digite parte do nome (ou use curingas: `*.docx`, `foto?.jpg`) e clique em
+**Buscar**. A busca procura na pasta atual e em todas as subpastas; dois cliques num
+resultado de pasta a abrem, e os resultados podem ser extraídos direto. Na linha de
+comando: `hdclone find pc.hdc 1 "*.docx" "Users\Ana"`.
+
+As datas de modificação são preservadas. Funciona com partições **NTFS e FAT32**
+(nomes longos e acentos), inclusive arquivos grandes e fragmentados. Ficam de fora, com aviso:
 arquivos **comprimidos pelo NTFS** (pastas com "Compactar conteúdo"), arquivos
 **criptografados com EFS** e atalhos de pasta (*junctions*, como "Documents and
 Settings" no Vista+, que apontam para outro lugar).
@@ -149,6 +206,8 @@ hdclone list                          lista os discos (número, tamanho, modelo,
 hdclone backup 1 E:\backup\pc.hdc     disco 1 -> imagem
 hdclone verify E:\backup\pc.hdc       confere a imagem (recomendado antes de restaurar)
 hdclone restore E:\backup\pc.hdc 2    imagem -> disco 2 (APAGA o disco 2)
+hdclone clone 1 2 --verify             disco 1 -> disco 2 direto (APAGA o disco 2)
+hdclone hwfix 2                        prepara o Windows do disco 2 para outro PC
 hdclone info E:\backup\pc.hdc
 ```
 
@@ -156,7 +215,7 @@ Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
 Opções: `-c N` (compressão zstd 1–19, padrão 3), `--compat` (formato antigo zlib), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
-`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--force`.
+`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--verify`, `--hwfix`, `--force`.
 
 ## Importante
 

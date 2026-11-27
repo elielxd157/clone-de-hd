@@ -36,6 +36,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <zlib.h>
 #include "zstd/zstd.h"
 
@@ -57,7 +58,7 @@
 #endif
 #endif
 
-#define VERSION_STR "hdclone 1.0"
+#define VERSION_STR "hdclone 2.0"
 #define CHUNK_SIZE (1024u * 1024u)
 #define HDR_SIZE 512
 #define FTR_SIZE 48
@@ -109,11 +110,73 @@ static void res_del(void *p)
 static void ui_log(const char *fmt, ...);
 static void ui_fatal(const char *msg);
 static void ui_progress(u64 done, u64 total, double speed, unsigned long eta);
-#define printf ui_log
 #endif
+
+/* ---- registro em arquivo (.log ao lado da imagem) ---- */
+
+static FILE *g_logf;
+static time_t g_log_t0;
+
+static void log_text(const char *s)
+{
+    if (!g_logf || s[0] == '\r') return; /* linhas de progresso nao vao para o arquivo */
+    fputs(s, g_logf);
+    fflush(g_logf);
+}
+
+/* toda a saida do programa passa por aqui: tela (ou janela) + arquivo de log */
+static void hd_printf(const char *fmt, ...)
+{
+    char b[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    log_text(b);
+#ifdef HDCLONE_GUI
+    ui_log("%s", b);
+#else
+    fputs(b, stdout);
+#endif
+}
+#define printf hd_printf
+
+static void log_open(const char *path, const char *what)
+{
+    char t[64];
+    struct tm *tm;
+    g_log_t0 = time(NULL);
+    g_logf = fopen(path, "w");
+    if (!g_logf) return;
+    tm = localtime(&g_log_t0);
+    if (tm) strftime(t, sizeof(t), "%d/%m/%Y %H:%M:%S", tm); else strcpy(t, "?");
+    fprintf(g_logf, "hdclone 2.0 - %s - inicio: %s\n", what, t);
+    fflush(g_logf);
+}
+
+static void log_close(const char *result)
+{
+    char t[64];
+    time_t now = time(NULL);
+    struct tm *tm;
+    long el = (long)(now - g_log_t0);
+    if (!g_logf) return;
+    tm = localtime(&now);
+    if (tm) strftime(t, sizeof(t), "%d/%m/%Y %H:%M:%S", tm); else strcpy(t, "?");
+    fprintf(g_logf, "\n\nResultado: %s\nFim: %s (duracao %02ld:%02ld:%02ld)\n", result, t, el / 3600, (el / 60) % 60,
+            el % 60);
+    fclose(g_logf);
+    g_logf = NULL;
+}
 
 static void die(const char *msg)
 {
+    if (g_logf) {
+        char b[700];
+        snprintf(b, sizeof(b), "\nERRO: %s\n", msg);
+        log_text(b);
+        log_close("FALHOU");
+    }
 #ifdef HDCLONE_GUI
     ui_fatal(msg); /* nao retorna */
 #else
@@ -2384,9 +2447,12 @@ typedef struct {
     int zero_free;
     int no_vss;
     int keep_sys;
+    int verify;   /* verificar a imagem (ou o disco clonado) ao terminar */
+    int hwfix;    /* preparar o Windows restaurado/clonado para outro hardware */
 } Opts;
 
 static int g_vss_used; /* ultimo backup usou VSS */
+static void cmd_verify(const char *path);
 static int g_shrunk;   /* ultima restauracao reduziu uma particao */
 
 /* ---- backup em pipeline ---- */
@@ -2507,6 +2573,11 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     u64 nchunks, used = 0, bad = 0, nfree = 0;
     char s1[32], s2[32];
 
+    {
+        char lp[700];
+        snprintf(lp, sizeof(lp), "%s.log", dst);
+        log_open(lp, "BACKUP");
+    }
     if (dev_open(&d, src, 0) != 0) die("nao foi possivel abrir o disco de origem (execute como Administrador)");
     if (!d.size) die("nao foi possivel obter o tamanho do disco de origem");
     fmt_size(d.size, s1);
@@ -2618,6 +2689,11 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     if (bad) printf("  ATENCAO: %llu setores ilegiveis foram preenchidos com zeros!\n", (unsigned long long)bad);
     if (g_vss_used) printf("  Copia consistente feita via VSS (snapshots temporarios ja removidos).\n");
     reset_areas();
+    if (o->verify) {
+        printf("\nVerificando a imagem gravada (lendo de volta do disco)...\n");
+        cmd_verify(dst);
+    }
+    log_close(o->verify ? "OK (imagem gravada e verificada)" : "OK");
 }
 
 /* ------------------------------------------------------------------ */
@@ -3083,7 +3159,7 @@ static void plan_shrink(Dev *img, u64 T, Plan *pl)
             snprintf(msg, sizeof(msg),
                      "os dados nao cabem no disco de destino (%s). Disco minimo necessario: %s. "
                      "Dica: no Windows de origem, use 'Gerenciamento de Disco > Diminuir volume' e "
-                     "faca o backup de novo; isso junta os dados no inicio da particao.", s1, s2);
+                     "repita a operacao; isso junta os dados no inicio da particao.", s1, s2);
         die(msg);
     }
 
@@ -3281,7 +3357,7 @@ static void apply_shrink(Dev *d, Plan *pl)
 }
 
 /* ------------------------------------------------------------------ */
-/* explorar a imagem: listar pastas e extrair arquivos (NTFS)          */
+/* explorar a imagem: listar, buscar e extrair arquivos (NTFS e FAT32)*/
 /* ------------------------------------------------------------------ */
 
 #ifdef _WIN32
@@ -3295,6 +3371,7 @@ typedef char xchar;
 typedef struct {
     u64 start, len;
     char label[96];
+    char fs[8];
 } VolInfo;
 
 static Dev g_vdev; /* disco virtual sobre g_is */
@@ -3359,7 +3436,343 @@ static int in_to_u16(const char *s, u16 *w, int max)
 #endif
 }
 
-/* lista as particoes NTFS da imagem */
+/* ---- leitor FAT32 somente leitura ---- */
+
+typedef struct {
+    Dev *d;
+    u64 off;
+    FatGeo g;
+    u8 *fc;        /* cache de 64 KB da FAT */
+    u64 fc_base;
+    u32 fc_len;
+} FatVol;
+
+static int fat_vopen(FatVol *f, Dev *d, u64 off, u64 plen)
+{
+    u8 b[512];
+    memset(f, 0, sizeof(*f));
+    f->d = d;
+    f->off = off;
+    if (dev_read_any(d, off, 512, b) != 0 || b[510] != 0x55 || b[511] != 0xAA || memcmp(b + 82, "FAT32   ", 8) != 0 ||
+        fat_geo(b, plen, &f->g) != 0)
+        return -1;
+    f->fc = malloc(65536);
+    f->fc_base = ~0ull;
+    return f->fc ? 0 : -1;
+}
+
+static void fat_vclose(FatVol *f)
+{
+    free(f->fc);
+    f->fc = NULL;
+}
+
+static u32 fat_next(FatVol *f, u32 cl)
+{
+    u64 pos = (u64)cl * 4, base = pos & ~65535ull, fatbytes = (u64)f->g.fatsz * f->g.bps;
+    if (cl < 2 || cl >= f->g.ncl + 2) return 0x0FFFFFFF;
+    if (f->fc_base != base) {
+        u32 n = fatbytes - base < 65536 ? (u32)(fatbytes - base) : 65536;
+        if (dev_read_any(f->d, f->off + (u64)f->g.rsv * f->g.bps + base, n, f->fc) != 0) return 0x0FFFFFFF;
+        f->fc_base = base;
+        f->fc_len = n;
+    }
+    if (pos - base + 4 > f->fc_len) return 0x0FFFFFFF;
+    return le32(f->fc + (pos - base)) & 0x0FFFFFFF;
+}
+
+static u64 fat_cl_off(FatVol *f, u32 cl) { return f->off + (f->g.data_sec + (u64)(cl - 2) * f->g.spc) * f->g.bps; }
+
+/* data/hora da FAT (hora local) -> FILETIME */
+static u64 fat_time(u16 d, u16 t)
+{
+    long long y = 1980 + (d >> 9), m = (d >> 5) & 15, dd = d & 31, era, yoe, doy, doe, days, unixt;
+    u64 ft;
+    if (!d || m < 1 || m > 12 || dd < 1) return 0;
+    y -= m <= 2;
+    era = y / 400;
+    yoe = y - era * 400;
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    days = era * 146097 + doe - 719468;
+    unixt = days * 86400 + (t >> 11) * 3600 + ((t >> 5) & 63) * 60 + (t & 31) * 2;
+    ft = (u64)(unixt + 11644473600LL) * 10000000ull;
+#ifdef _WIN32
+    {
+        FILETIME lf, uf;
+        lf.dwLowDateTime = (DWORD)ft;
+        lf.dwHighDateTime = (DWORD)(ft >> 32);
+        if (LocalFileTimeToFileTime(&lf, &uf)) ft = ((u64)uf.dwHighDateTime << 32) | uf.dwLowDateTime;
+    }
+#endif
+    return ft;
+}
+
+/* ---- mapa de um arquivo no disco (NTFS ou FAT32) ---- */
+
+typedef struct {
+    u64 off, len; /* posicao no disco e tamanho do trecho */
+    int sparse;
+} Ext;
+
+typedef struct {
+    Ext *e;
+    int n, cap;
+    u64 size, init_size;
+    int resident;
+    u8 *res;
+    u32 res_len;
+} FMap;
+
+static void fm_free(FMap *m)
+{
+    free(m->e);
+    free(m->res);
+    memset(m, 0, sizeof(*m));
+}
+
+static int fm_add(FMap *m, u64 off, u64 len, int sparse)
+{
+    if (m->n && m->e[m->n - 1].sparse == sparse && (sparse || m->e[m->n - 1].off + m->e[m->n - 1].len == off)) {
+        m->e[m->n - 1].len += len;
+        return 0;
+    }
+    if (m->n == m->cap) {
+        int nc = m->cap ? m->cap * 2 : 16;
+        Ext *ne = realloc(m->e, sizeof(Ext) * nc);
+        if (!ne) return -1;
+        m->e = ne;
+        m->cap = nc;
+    }
+    m->e[m->n].off = off;
+    m->e[m->n].len = len;
+    m->e[m->n].sparse = sparse;
+    m->n++;
+    return 0;
+}
+
+static u64 fm_total(const FMap *m)
+{
+    u64 t = 0;
+    int i;
+    for (i = 0; i < m->n; i++) t += m->e[i].len;
+    return t;
+}
+
+/* le bytes do arquivo (alem dos trechos ou esparso = zeros) */
+static int fm_read(Dev *d, const FMap *m, u64 off, u64 len, u8 *out)
+{
+    u64 pos = 0;
+    int i;
+    if (m->resident) {
+        u64 n = off < m->res_len ? (m->res_len - off < len ? m->res_len - off : len) : 0;
+        if (n) memcpy(out, m->res + off, (size_t)n);
+        if (n < len) memset(out + n, 0, (size_t)(len - n));
+        return 0;
+    }
+    for (i = 0; i < m->n && len; i++) {
+        const Ext *e = &m->e[i];
+        if (off < pos + e->len) {
+            u64 in = off - pos, n = e->len - in < len ? e->len - in : len;
+            if (e->sparse) memset(out, 0, (size_t)n);
+            else if (dev_read_any(d, e->off + in, n, out) != 0) return -1;
+            out += n; off += n; len -= n;
+        }
+        pos += e->len;
+    }
+    if (len) memset(out, 0, (size_t)len);
+    return 0;
+}
+
+/* posicao no disco do byte "off" do arquivo; -1 se esparso/fora */
+static int fm_locate(const FMap *m, u64 off, u64 *disk)
+{
+    u64 pos = 0;
+    int i;
+    if (m->resident) return -1;
+    for (i = 0; i < m->n; i++) {
+        if (off < pos + m->e[i].len) {
+            if (m->e[i].sparse) return -1;
+            *disk = m->e[i].off + (off - pos);
+            return 0;
+        }
+        pos += m->e[i].len;
+    }
+    return -1;
+}
+
+static int fat_fmap(FatVol *f, u32 first, u64 size, int is_dir, FMap *m)
+{
+    u32 cl = first;
+    u64 guard = 0;
+    memset(m, 0, sizeof(*m));
+    m->size = m->init_size = size;
+    if (first < 2) return size ? -1 : 0;
+    while (cl >= 2 && cl < 0x0FFFFFF8 && guard++ <= f->g.ncl) {
+        if (cl >= f->g.ncl + 2 || fm_add(m, fat_cl_off(f, cl), f->g.cs, 0) != 0) { fm_free(m); return -1; }
+        if (!is_dir && fm_total(m) >= size) break;
+        cl = fat_next(f, cl);
+    }
+    if (is_dir) m->size = m->init_size = fm_total(m);
+    else if (fm_total(m) < size) { fm_free(m); return -1; }
+    return 0;
+}
+
+static u8 lfn_sum(const u8 *e)
+{
+    u8 sum = 0;
+    int i;
+    for (i = 0; i < 11; i++) sum = (u8)(((sum & 1) << 7) + (sum >> 1) + e[i]);
+    return sum;
+}
+
+/* lista uma pasta FAT32 (nomes longos inclusive) */
+static int fat_list(FatVol *f, u32 dircl, DirList *dl)
+{
+    FMap m;
+    u8 *buf;
+    u64 i;
+    u16 lfn[261];
+    int lfn_ok = 0;
+    u8 sum = 0;
+    memset(dl, 0, sizeof(*dl));
+    if (fat_fmap(f, dircl, 0, 1, &m) != 0) return -1;
+    if (m.size > 64ull * 1024 * 1024 || !(buf = malloc((size_t)m.size + 1))) { fm_free(&m); return -1; }
+    if (fm_read(f->d, &m, 0, m.size, buf) != 0) { free(buf); fm_free(&m); return -1; }
+    for (i = 0; i + 32 <= m.size; i += 32) {
+        u8 *e = buf + i;
+        DirEnt *d;
+        int k, n = 0;
+        if (e[0] == 0) break;
+        if (e[0] == 0xE5) { lfn_ok = 0; continue; }
+        if (e[11] == 0x0F) { /* pedaco de nome longo */
+            int seq = e[0] & 0x1F, idx = (seq - 1) * 13;
+            static const int pos[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+            if (e[0] & 0x40) {
+                for (k = 0; k < 261; k++) lfn[k] = 0;
+                sum = e[13];
+                lfn_ok = 1;
+            }
+            if (seq < 1 || idx + 13 > 260 || e[13] != sum) { lfn_ok = 0; continue; }
+            for (k = 0; k < 13; k++) lfn[idx + k] = le16(e + pos[k]);
+            continue;
+        }
+        if (e[11] & 0x08) { lfn_ok = 0; continue; } /* rotulo do volume */
+        if (dl->n == dl->cap) {
+            int nc = dl->cap ? dl->cap * 2 : 64;
+            DirEnt *ne = realloc(dl->e, sizeof(DirEnt) * nc);
+            if (!ne) break;
+            dl->e = ne;
+            dl->cap = nc;
+        }
+        d = &dl->e[dl->n];
+        memset(d, 0, sizeof(*d));
+        if (lfn_ok && lfn_sum(e) == sum) {
+            while (n < 255 && lfn[n] && lfn[n] != 0xFFFF) { d->name[n] = lfn[n]; n++; }
+        }
+        if (!n) { /* nome curto 8.3 (com minusculas do NT) */
+            int lb = e[12] & 0x08, le = e[12] & 0x10, j;
+            for (j = 0; j < 8 && e[j] != ' '; j++) d->name[n++] = (u16)((lb && e[j] >= 'A' && e[j] <= 'Z') ? e[j] + 32 : (j == 0 && e[0] == 0x05 ? 0xE5 : e[j]));
+            if (e[8] != ' ') {
+                d->name[n++] = '.';
+                for (j = 8; j < 11 && e[j] != ' '; j++) d->name[n++] = (u16)((le && e[j] >= 'A' && e[j] <= 'Z') ? e[j] + 32 : e[j]);
+            }
+        }
+        lfn_ok = 0;
+        d->nlen = n;
+        if ((n == 1 && d->name[0] == '.') || (n == 2 && d->name[0] == '.' && d->name[1] == '.')) continue;
+        d->rec = ((u32)le16(e + 20) << 16) | le16(e + 26);
+        d->is_dir = (e[11] & 0x10) != 0;
+        d->size = d->is_dir ? 0 : le32(e + 28);
+        d->mtime = fat_time(le16(e + 24), le16(e + 22));
+        dl->n++;
+    }
+    free(buf);
+    fm_free(&m);
+    qsort(dl->e, dl->n, sizeof(DirEnt), dirent_order);
+    return 0;
+}
+
+/* ---- sistema de arquivos generico (NTFS ou FAT32) ---- */
+
+#define FS_NTFS 1
+#define FS_FAT32 2
+
+typedef struct {
+    int type;
+    Ntfs nt;
+    FatVol fv;
+} Fs;
+
+static int fs_open(Fs *fs, Dev *d, u64 off, u64 len)
+{
+    memset(fs, 0, sizeof(*fs));
+    if (nt_open(&fs->nt, d, off, len) == 0) { fs->type = FS_NTFS; return 0; }
+    if (fat_vopen(&fs->fv, d, off, len) == 0) { fs->type = FS_FAT32; return 0; }
+    return -1;
+}
+
+static void fs_close(Fs *fs)
+{
+    if (fs->type == FS_NTFS) nt_close(&fs->nt);
+    else if (fs->type == FS_FAT32) fat_vclose(&fs->fv);
+    fs->type = 0;
+}
+
+static Dev *fs_dev(Fs *fs) { return fs->type == FS_NTFS ? fs->nt.d : fs->fv.d; }
+static u64 fs_root(Fs *fs) { return fs->type == FS_NTFS ? 5 : fs->fv.g.root; }
+
+static int fs_list(Fs *fs, u64 dir, DirList *dl)
+{
+    if (fs->type == FS_NTFS) return nt_list(&fs->nt, dir, dl);
+    return fat_list(&fs->fv, (u32)dir, dl);
+}
+
+/* mapa dos dados de um arquivo. 0 = ok, 1 = formato nao suportado (why), -1 = erro */
+static int fs_fmap(Fs *fs, const DirEnt *e, FMap *m, const char **why)
+{
+    memset(m, 0, sizeof(*m));
+    if (fs->type == FS_FAT32) return fat_fmap(&fs->fv, (u32)e->rec, e->size, 0, m);
+    {
+        AttrData ad;
+        int i;
+        u64 cs = fs->nt.g.cs;
+        if (nt_get_attr(&fs->nt, e->rec, 0x80, NULL, &ad) != 0) return -1;
+        if (ad.flags & 0x0001) { *why = "comprimido pelo NTFS"; ad_free(&ad); return 1; }
+        if (ad.flags & 0x4000) { *why = "criptografado com EFS"; ad_free(&ad); return 1; }
+        m->size = ad.size;
+        m->init_size = ad.init_size;
+        if (ad.resident) {
+            m->resident = 1;
+            m->res = ad.res;
+            m->res_len = ad.res_len;
+            ad.res = NULL;
+        } else {
+            for (i = 0; i < ad.rl.n; i++)
+                if (fm_add(m, ad.rl.r[i].lcn < 0 ? 0 : fs->nt.off + (u64)ad.rl.r[i].lcn * cs, ad.rl.r[i].len * cs,
+                           ad.rl.r[i].lcn < 0) != 0) {
+                    ad_free(&ad);
+                    fm_free(m);
+                    return -1;
+                }
+        }
+        ad_free(&ad);
+        return 0;
+    }
+}
+
+static u64 fs_mtime(Fs *fs, const DirEnt *e)
+{
+    u64 mt = e->mtime;
+    if (fs->type == FS_NTFS) {
+        AttrData si;
+        if (nt_get_attr(&fs->nt, e->rec, 0x10, NULL, &si) == 0 && si.resident && si.res_len >= 16) mt = le64(si.res + 8);
+        ad_free(&si);
+    }
+    return mt;
+}
+
+/* lista as particoes NTFS e FAT32 da imagem */
 static int image_volumes(Dev *v, VolInfo *out, int max)
 {
     PTable *t = malloc(sizeof(PTable));
@@ -3367,33 +3780,45 @@ static int image_volumes(Dev *v, VolInfo *out, int max)
     if (!t) return 0;
     if (list_parts(v, t) != 0) { free(t); return 0; }
     for (i = 0; i < t->n && n < max; i++) {
-        Ntfs nt;
-        AttrData ad;
-        if (nt_open(&nt, v, t->p[i].start, t->p[i].len) != 0) continue;
+        Fs fs;
+        if (fs_open(&fs, v, t->p[i].start, t->p[i].len) != 0) continue;
         out[n].start = t->p[i].start;
         out[n].len = t->p[i].len;
         out[n].label[0] = 0;
-        if (nt_get_attr(&nt, 3, 0x60, NULL, &ad) == 0 && ad.resident) {
-            u16 w[64];
-            int k, nl = (int)(ad.res_len / 2 < 64 ? ad.res_len / 2 : 63);
-            for (k = 0; k < nl; k++) w[k] = le16(ad.res + 2 * k);
-            u16_to_out(w, nl, out[n].label, sizeof(out[n].label));
+        strcpy(out[n].fs, fs.type == FS_NTFS ? "NTFS" : "FAT32");
+        if (fs.type == FS_NTFS) {
+            AttrData ad;
+            if (nt_get_attr(&fs.nt, 3, 0x60, NULL, &ad) == 0 && ad.resident) {
+                u16 w[64];
+                int k, nl = (int)(ad.res_len / 2 < 64 ? ad.res_len / 2 : 63);
+                for (k = 0; k < nl; k++) w[k] = le16(ad.res + 2 * k);
+                u16_to_out(w, nl, out[n].label, sizeof(out[n].label));
+            }
+            ad_free(&ad);
+        } else {
+            u8 b[512];
+            if (dev_read_any(v, t->p[i].start, 512, b) == 0 && memcmp(b + 71, "NO NAME    ", 11) != 0) {
+                int k = 11;
+                memcpy(out[n].label, b + 71, 11);
+                while (k > 0 && (out[n].label[k - 1] == ' ' || !out[n].label[k - 1])) k--;
+                out[n].label[k] = 0;
+            }
         }
-        ad_free(&ad);
-        nt_close(&nt);
+        fs_close(&fs);
         n++;
     }
     free(t);
     return n;
 }
 
-/* resolve um caminho ("/" ou "\\" como separador) -> registro da MFT */
-static int nt_lookup(Ntfs *nt, const char *path, u64 *rec, int *is_dir)
+/* resolve um caminho ("/" ou "\\" como separador); devolve a entrada */
+static int fs_lookup(Fs *fs, const char *path, DirEnt *out)
 {
     char comp[512];
     const char *p = path;
-    *rec = 5;
-    *is_dir = 1;
+    memset(out, 0, sizeof(*out));
+    out->rec = fs_root(fs);
+    out->is_dir = 1;
     for (;;) {
         int n = 0, i, found = 0;
         u16 w[512];
@@ -3403,13 +3828,12 @@ static int nt_lookup(Ntfs *nt, const char *path, u64 *rec, int *is_dir)
         if (!*p) return 0;
         while (*p && *p != '/' && *p != '\\' && n < 511) comp[n++] = *p++;
         comp[n] = 0;
-        if (!*is_dir) return -1;
+        if (!out->is_dir) return -1;
         wl = in_to_u16(comp, w, 512);
-        if (nt_list(nt, *rec, &dl) != 0) return -1;
+        if (fs_list(fs, out->rec, &dl) != 0) return -1;
         for (i = 0; i < dl.n; i++)
             if (name_cmp(dl.e[i].name, dl.e[i].nlen, w, wl) == 0) {
-                *rec = dl.e[i].rec;
-                *is_dir = dl.e[i].is_dir;
+                *out = dl.e[i];
                 found = 1;
                 break;
             }
@@ -3496,64 +3920,61 @@ static int x_mkdir(const xchar *p)
 }
 
 /* copia um arquivo da imagem para o disco */
-static void nt_extract_file(Ntfs *nt, const DirEnt *e, const xchar *path)
+/* copia um arquivo da imagem para o disco */
+static void fs_extract_file(Fs *fs, const DirEnt *e, const xchar *path)
 {
-    AttrData ad, si;
-    u64 off = 0, mtime = e->mtime;
+    FMap m;
+    const char *why = NULL;
+    u64 off = 0, mtime;
     u8 *buf = NULL;
-    int ok = 1;
+    int ok = 1, r;
 #ifdef _WIN32
     wchar_t lb[1100];
     HANDLE f;
 #else
     FILE *f;
 #endif
-    if (nt_get_attr(nt, e->rec, 0x80, NULL, &ad) != 0) { xs_note("ERRO ao ler (ignorado)", e); g_xs.errors++; return; }
-    if (ad.flags & 0x0001) { xs_note("ignorado (comprimido pelo NTFS)", e); g_xs.skipped++; ad_free(&ad); return; }
-    if (ad.flags & 0x4000) { xs_note("ignorado (criptografado com EFS)", e); g_xs.skipped++; ad_free(&ad); return; }
-    if (nt_get_attr(nt, e->rec, 0x10, NULL, &si) == 0 && si.resident && si.res_len >= 16) mtime = le64(si.res + 8);
-    ad_free(&si);
+    r = fs_fmap(fs, e, &m, &why);
+    if (r < 0) { xs_note("ERRO ao ler (ignorado)", e); g_xs.errors++; return; }
+    if (r > 0) {
+        char t[80];
+        snprintf(t, sizeof(t), "ignorado (%s)", why);
+        xs_note(t, e);
+        g_xs.skipped++;
+        return;
+    }
+    mtime = fs_mtime(fs, e);
 #ifdef _WIN32
     f = CreateFileW(x_long(path, lb, 1100), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; ad_free(&ad); return; }
+    if (f == INVALID_HANDLE_VALUE) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; fm_free(&m); return; }
 #else
     f = fopen(path, "wb");
-    if (!f) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; ad_free(&ad); return; }
+    if (!f) { xs_note("ERRO ao criar (ignorado)", e); g_xs.errors++; fm_free(&m); return; }
 #endif
-    if (ad.resident) {
-#ifdef _WIN32
-        DWORD w;
-        ok = WriteFile(f, ad.res, ad.res_len, &w, NULL) && w == ad.res_len;
-#else
-        ok = fwrite(ad.res, 1, ad.res_len, f) == ad.res_len;
-#endif
-        g_xs.bytes += ad.res_len;
-    } else {
-        buf = malloc(CHUNK_SIZE);
-        if (!buf) ok = 0;
-        while (ok && off < ad.size) {
-            u64 n = ad.size - off < CHUNK_SIZE ? ad.size - off : CHUNK_SIZE;
-            if (g_cancel) { g_xs.cancelled = 1; ok = 0; break; }
-            if (off >= ad.init_size) memset(buf, 0, (size_t)n); /* alem do "inicializado" = zeros */
-            else {
-                u64 r = ad.init_size - off < n ? ad.init_size - off : n;
-                if (nt_read_rl(nt, &ad.rl, off, r, buf) != 0) { ok = 0; break; }
-                if (r < n) memset(buf + r, 0, (size_t)(n - r));
-            }
-#ifdef _WIN32
-            {
-                DWORD w;
-                if (!WriteFile(f, buf, (DWORD)n, &w, NULL) || w != n) { ok = 0; break; }
-            }
-#else
-            if (fwrite(buf, 1, (size_t)n, f) != n) { ok = 0; break; }
-#endif
-            off += n;
-            g_xs.bytes += n;
-            progress(g_xs.bytes < g_xs.total ? g_xs.bytes : g_xs.total, g_xs.total, 0);
+    buf = malloc(CHUNK_SIZE);
+    if (!buf) ok = 0;
+    while (ok && off < m.size) {
+        u64 n = m.size - off < CHUNK_SIZE ? m.size - off : CHUNK_SIZE;
+        if (g_cancel) { g_xs.cancelled = 1; ok = 0; break; }
+        if (off >= m.init_size) memset(buf, 0, (size_t)n); /* alem do "inicializado" = zeros */
+        else {
+            u64 rr = m.init_size - off < n ? m.init_size - off : n;
+            if (fm_read(fs_dev(fs), &m, off, rr, buf) != 0) { ok = 0; break; }
+            if (rr < n) memset(buf + rr, 0, (size_t)(n - rr));
         }
-        free(buf);
+#ifdef _WIN32
+        {
+            DWORD w;
+            if (!WriteFile(f, buf, (DWORD)n, &w, NULL) || w != n) { ok = 0; break; }
+        }
+#else
+        if (fwrite(buf, 1, (size_t)n, f) != n) { ok = 0; break; }
+#endif
+        off += n;
+        g_xs.bytes += n;
+        progress(g_xs.bytes < g_xs.total ? g_xs.bytes : g_xs.total, g_xs.total, 0);
     }
+    free(buf);
 #ifdef _WIN32
     if (mtime) {
         FILETIME ft;
@@ -3571,24 +3992,24 @@ static void nt_extract_file(Ntfs *nt, const DirEnt *e, const xchar *path)
         utimes(path, tv);
     }
 #endif
-    if (g_xs.cancelled) { ad_free(&ad); return; }
+    fm_free(&m);
+    if (g_xs.cancelled) return;
     if (!ok) { xs_note("ERRO na copia (disco cheio ou imagem danificada)", e); g_xs.errors++; }
     else g_xs.files++;
-    ad_free(&ad);
 }
 
 /* soma tamanhos (para a barra de progresso) */
-static void nt_du(Ntfs *nt, const DirEnt *e, int depth)
+static void fs_du(Fs *fs, const DirEnt *e, int depth)
 {
     DirList dl;
     int i;
     if (!e->is_dir) { g_xs.total += e->size; return; }
-    if (depth > 64 || (e->attr & FA_REPARSE) || nt_list(nt, e->rec, &dl) != 0) return;
-    for (i = 0; i < dl.n && !g_cancel; i++) nt_du(nt, &dl.e[i], depth + 1);
+    if (depth > 64 || (e->attr & FA_REPARSE) || fs_list(fs, e->rec, &dl) != 0) return;
+    for (i = 0; i < dl.n && !g_cancel; i++) fs_du(fs, &dl.e[i], depth + 1);
     dl_free(&dl);
 }
 
-static void nt_extract_entry(Ntfs *nt, const DirEnt *e, const xchar *dest, int depth)
+static void fs_extract_entry(Fs *fs, const DirEnt *e, const xchar *dest, int depth)
 {
     xchar path[1100];
     DirList dl;
@@ -3596,27 +4017,27 @@ static void nt_extract_entry(Ntfs *nt, const DirEnt *e, const xchar *dest, int d
     if (g_cancel) { g_xs.cancelled = 1; return; }
     if (e->attr & FA_REPARSE) { xs_note("ignorado (atalho de pasta/junction)", e); g_xs.skipped++; return; }
     x_join(path, 1100, dest, e);
-    if (!e->is_dir) { nt_extract_file(nt, e, path); return; }
+    if (!e->is_dir) { fs_extract_file(fs, e, path); return; }
     if (depth > 64 || x_mkdir(path) != 0) { xs_note("ERRO ao criar pasta", e); g_xs.errors++; return; }
     g_xs.dirs++;
-    if (nt_list(nt, e->rec, &dl) != 0) { xs_note("ERRO ao ler pasta", e); g_xs.errors++; return; }
-    for (i = 0; i < dl.n && !g_xs.cancelled; i++) nt_extract_entry(nt, &dl.e[i], path, depth + 1);
+    if (fs_list(fs, e->rec, &dl) != 0) { xs_note("ERRO ao ler pasta", e); g_xs.errors++; return; }
+    for (i = 0; i < dl.n && !g_xs.cancelled; i++) fs_extract_entry(fs, &dl.e[i], path, depth + 1);
     dl_free(&dl);
 }
 
 /* extrai uma selecao de itens para a pasta dest */
-static void extract_entries(Ntfs *nt, const DirEnt *sel, int nsel, const xchar *dest)
+static void extract_entries(Fs *fs, const DirEnt *sel, int nsel, const xchar *dest)
 {
     int i;
     char s1[32];
     memset(&g_xs, 0, sizeof(g_xs));
     printf("Calculando tamanho...\n");
-    for (i = 0; i < nsel; i++) nt_du(nt, &sel[i], 0);
+    for (i = 0; i < nsel; i++) fs_du(fs, &sel[i], 0);
     if (!g_xs.total) g_xs.total = 1;
     fmt_size(g_xs.total, s1);
     printf("Extraindo %s...\n", s1);
     g_t0 = g_tlast = now_ms();
-    for (i = 0; i < nsel && !g_xs.cancelled; i++) nt_extract_entry(nt, &sel[i], dest, 0);
+    for (i = 0; i < nsel && !g_xs.cancelled; i++) fs_extract_entry(fs, &sel[i], dest, 0);
     progress(g_xs.total, g_xs.total, 1);
     fmt_size(g_xs.bytes, s1);
     printf("\n%s: %llu arquivos, %llu pastas, %s", g_xs.cancelled ? "Cancelado" : "Concluido",
@@ -3626,36 +4047,139 @@ static void extract_entries(Ntfs *nt, const DirEnt *sel, int nsel, const xchar *
     printf("\n");
 }
 
+/* ---- busca por nome ---- */
+
+typedef struct {
+    DirEnt e;
+    u16 *path;  /* caminho completo (\pasta\arquivo) */
+    int plen;
+} Found;
+
+typedef struct {
+    Found *f;
+    int n, cap;
+    u64 dirs;
+    int truncated;
+} FoundList;
+
+#define MAX_FOUND 20000
+
+static void found_free(FoundList *fl)
+{
+    int i;
+    for (i = 0; i < fl->n; i++) free(fl->f[i].path);
+    free(fl->f);
+    memset(fl, 0, sizeof(*fl));
+}
+
+/* compara com curingas * e ? (sem diferenciar maiusculas) */
+static int wild(const u16 *p, int pn, const u16 *s, int sn)
+{
+    int pi = 0, si = 0, star = -1, mark = 0;
+    while (si < sn) {
+        if (pi < pn && (p[pi] == '?' || fold16(p[pi]) == fold16(s[si]))) { pi++; si++; }
+        else if (pi < pn && p[pi] == '*') { star = pi++; mark = si; }
+        else if (star >= 0) { pi = star + 1; si = ++mark; }
+        else return 0;
+    }
+    while (pi < pn && p[pi] == '*') pi++;
+    return pi == pn;
+}
+
+static void fs_find(Fs *fs, u64 dir, u16 *path, int plen, const u16 *pat, int pn, FoundList *fl, int depth)
+{
+    DirList dl;
+    int i;
+    if (depth > 64 || g_cancel || fl->truncated || fs_list(fs, dir, &dl) != 0) return;
+    fl->dirs++;
+    for (i = 0; i < dl.n && !g_cancel && !fl->truncated; i++) {
+        DirEnt *e = &dl.e[i];
+        int nl = plen;
+        if (nl + 1 + e->nlen >= 4096) continue;
+        path[nl++] = '\\';
+        memcpy(path + nl, e->name, e->nlen * sizeof(u16));
+        nl += e->nlen;
+        if (wild(pat, pn, e->name, e->nlen)) {
+            if (fl->n >= MAX_FOUND) { fl->truncated = 1; break; }
+            if (fl->n == fl->cap) {
+                int nc = fl->cap ? fl->cap * 2 : 64;
+                Found *nf = realloc(fl->f, sizeof(Found) * nc);
+                if (!nf) break;
+                fl->f = nf;
+                fl->cap = nc;
+            }
+            fl->f[fl->n].e = *e;
+            fl->f[fl->n].path = malloc(nl * sizeof(u16));
+            if (!fl->f[fl->n].path) break;
+            memcpy(fl->f[fl->n].path, path, nl * sizeof(u16));
+            fl->f[fl->n].plen = nl;
+            fl->n++;
+        }
+        if (e->is_dir && !(e->attr & FA_REPARSE)) fs_find(fs, e->rec, path, nl, pat, pn, fl, depth + 1);
+    }
+    dl_free(&dl);
+}
+
+/* busca a partir da pasta "dir"; sem curingas = "contem o texto" */
+static void find_files(Fs *fs, u64 dir, const u16 *text, int tn, FoundList *fl)
+{
+    u16 pat[300], *path = malloc(4096 * sizeof(u16));
+    int pn = 0, i, has = 0;
+    memset(fl, 0, sizeof(*fl));
+    if (!path) return;
+    for (i = 0; i < tn; i++)
+        if (text[i] == '*' || text[i] == '?') has = 1;
+    if (!has) pat[pn++] = '*';
+    for (i = 0; i < tn && pn < 297; i++) pat[pn++] = text[i];
+    if (!has) pat[pn++] = '*';
+    fs_find(fs, dir, path, 0, pat, pn, fl, 0);
+    free(path);
+}
+
+static void open_volume_cli(const char *img, const char *vol, VolInfo *v, Fs *fs)
+{
+    int nv, k;
+    VolInfo vv[32];
+    printf("Abrindo a imagem...\n");
+    open_virtual(img);
+    printf("\n");
+    nv = image_volumes(&g_vdev, vv, 32);
+    k = atoi(vol) - 1;
+    if (k < 0 || k >= nv) die("numero de particao invalido (veja 'hdclone ls <imagem>')");
+    *v = vv[k];
+    if (fs_open(fs, &g_vdev, v->start, v->len) != 0) die("nao foi possivel abrir a particao");
+}
+
 #ifdef HDCLONE_GUI
 __attribute__((unused))
 #endif
 static void cmd_ls(const char *img, const char *vol, const char *path)
 {
-    VolInfo v[32];
-    int nv, i, is_dir;
+    int i;
     char sz[32];
-    printf("Abrindo a imagem...\n");
-    open_virtual(img);
-    printf("\n");
-    nv = image_volumes(&g_vdev, v, 32);
     if (!vol) {
-        printf("Particoes NTFS na imagem:\n");
+        VolInfo v[32];
+        int nv;
+        printf("Abrindo a imagem...\n");
+        open_virtual(img);
+        printf("\n");
+        nv = image_volumes(&g_vdev, v, 32);
+        printf("Particoes na imagem:\n");
         for (i = 0; i < nv; i++) {
             fmt_size(v[i].len, sz);
-            printf("  %d  %-10s  rotulo: %-20s (inicio em %llu MB)\n", i + 1, sz, v[i].label[0] ? v[i].label : "-",
-                   (unsigned long long)(v[i].start >> 20));
+            printf("  %d  %-5s  %-10s  rotulo: %-20s (inicio em %llu MB)\n", i + 1, v[i].fs, sz,
+                   v[i].label[0] ? v[i].label : "-", (unsigned long long)(v[i].start >> 20));
         }
-        if (!nv) printf("  (nenhuma)\n");
+        if (!nv) printf("  (nenhuma particao NTFS ou FAT32)\n");
         printf("\nUse: hdclone ls <imagem> <numero> [pasta]\n");
     } else {
-        Ntfs nt;
-        u64 rec;
+        Fs fs;
+        VolInfo v;
+        DirEnt d;
         DirList dl;
-        int k = atoi(vol) - 1;
-        if (k < 0 || k >= nv) die("numero de particao invalido (veja 'hdclone ls <imagem>')");
-        if (nt_open(&nt, &g_vdev, v[k].start, v[k].len) != 0) die("nao foi possivel abrir o NTFS");
-        if (nt_lookup(&nt, path ? path : "", &rec, &is_dir) != 0 || !is_dir) die("pasta nao encontrada");
-        if (nt_list(&nt, rec, &dl) != 0) die("nao foi possivel ler a pasta");
+        open_volume_cli(img, vol, &v, &fs);
+        if (fs_lookup(&fs, path ? path : "", &d) != 0 || !d.is_dir) die("pasta nao encontrada");
+        if (fs_list(&fs, d.rec, &dl) != 0) die("nao foi possivel ler a pasta");
         for (i = 0; i < dl.n; i++) {
             char nm[600], dt[24];
             u16_to_out(dl.e[i].name, dl.e[i].nlen, nm, sizeof(nm));
@@ -3665,8 +4189,38 @@ static void cmd_ls(const char *img, const char *vol, const char *path)
         }
         printf("  %d itens\n", dl.n);
         dl_free(&dl);
-        nt_close(&nt);
+        fs_close(&fs);
     }
+    imgsrc_close();
+}
+
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
+static void cmd_find(const char *img, const char *vol, const char *text, const char *dir)
+{
+    Fs fs;
+    VolInfo v;
+    DirEnt d;
+    FoundList fl;
+    u16 w[300];
+    int wl, i;
+    open_volume_cli(img, vol, &v, &fs);
+    if (fs_lookup(&fs, dir ? dir : "", &d) != 0 || !d.is_dir) die("pasta nao encontrada");
+    wl = in_to_u16(text, w, 300);
+    printf("Procurando \"%s\"...\n", text);
+    find_files(&fs, d.rec, w, wl, &fl);
+    for (i = 0; i < fl.n; i++) {
+        char nm[1600], dt[24];
+        u16_to_out(fl.f[i].path, fl.f[i].plen, nm, sizeof(nm));
+        ft_to_str(fl.f[i].e.mtime, dt);
+        if (fl.f[i].e.is_dir) printf("  %-16s  %12s  %s\\\n", dt, "<PASTA>", nm);
+        else printf("  %-16s  %12llu  %s\n", dt, (unsigned long long)fl.f[i].e.size, nm);
+    }
+    printf("  %d encontrado(s) em %llu pastas%s\n", fl.n, (unsigned long long)fl.dirs,
+           fl.truncated ? " (lista cortada: refine a busca)" : "");
+    found_free(&fl);
+    fs_close(&fs);
     imgsrc_close();
 }
 
@@ -3675,22 +4229,13 @@ __attribute__((unused))
 #endif
 static void cmd_extract(const char *img, const char *vol, const char *path, const char *dest)
 {
-    VolInfo v[32];
-    int nv, k, is_dir;
-    Ntfs nt;
+    Fs fs;
+    VolInfo v;
     DirEnt e;
     xchar xdest[1100];
     const char *base;
-    printf("Abrindo a imagem...\n");
-    open_virtual(img);
-    printf("\n");
-    nv = image_volumes(&g_vdev, v, 32);
-    k = atoi(vol) - 1;
-    if (k < 0 || k >= nv) die("numero de particao invalido (veja 'hdclone ls <imagem>')");
-    if (nt_open(&nt, &g_vdev, v[k].start, v[k].len) != 0) die("nao foi possivel abrir o NTFS");
-    memset(&e, 0, sizeof(e));
-    if (nt_lookup(&nt, path, &e.rec, &is_dir) != 0) die("arquivo ou pasta nao encontrado na imagem");
-    e.is_dir = is_dir;
+    open_volume_cli(img, vol, &v, &fs);
+    if (fs_lookup(&fs, path, &e) != 0) die("arquivo ou pasta nao encontrado na imagem");
     /* nome = ultimo componente do caminho (raiz: "particao") */
     base = path + strlen(path);
     while (base > path && (base[-1] == '/' || base[-1] == '\\')) base--;
@@ -3706,9 +4251,9 @@ static void cmd_extract(const char *img, const char *vol, const char *path, cons
             e.nlen = in_to_u16(tmp, e.name, 256);
         }
     }
-    if (!is_dir) {
+    if (!e.is_dir && fs.type == FS_NTFS) {
         AttrData ad;
-        if (nt_get_attr(&nt, e.rec, 0x80, NULL, &ad) == 0) e.size = ad.size;
+        if (nt_get_attr(&fs.nt, e.rec, 0x80, NULL, &ad) == 0) e.size = ad.size;
         ad_free(&ad);
     }
 #ifdef _WIN32
@@ -3717,10 +4262,305 @@ static void cmd_extract(const char *img, const char *vol, const char *path, cons
     snprintf(xdest, sizeof(xdest), "%s", dest);
 #endif
     if (x_mkdir(xdest) != 0) die("nao foi possivel criar a pasta de destino");
-    extract_entries(&nt, &e, 1, xdest);
-    nt_close(&nt);
+    extract_entries(&fs, &e, 1, xdest);
+    fs_close(&fs);
     imgsrc_close();
     if (g_xs.errors) die("alguns arquivos nao puderam ser extraidos (veja acima)");
+}
+
+
+/* ------------------------------------------------------------------ */
+/* preparar o Windows para outro hardware (evitar tela azul 0x7B)      */
+/* ------------------------------------------------------------------ */
+/*
+ * A tela azul INACCESSIBLE_BOOT_DEVICE (0x7B) acontece quando o driver da
+ * controladora de disco do PC novo nao esta marcado para iniciar no boot.
+ * Aqui os drivers de disco que ja vem no Windows passam a iniciar no boot
+ * (Start = 0), no registro SYSTEM do disco restaurado/clonado:
+ *   XP/2000/2003 : atapi, intelide, pciide           (ideia do "MergeIDE")
+ *   Vista/7      : + msahci, iaStorV                 (KB922976 da Microsoft)
+ *   8/8.1/10/11  : + storahci, stornvme e StartOverride zerado
+ * So valores que ja existem sao alterados, no proprio lugar: nenhuma chave e
+ * criada e a estrutura do registro nao muda.
+ */
+
+typedef struct {
+    u8 *b;
+    u64 len;
+} Hive;
+
+/* dados de uma celula (offset relativo ao inicio dos hbins, em 0x1000) */
+static u8 *hv_at(Hive *h, u32 off, u32 need)
+{
+    u64 p = 0x1000ull + off;
+    if (off == 0xFFFFFFFFu || p + 4 + need > h->len) return NULL;
+    return h->b + p + 4;
+}
+
+static int hv_name_is(Hive *h, u32 nk_off, const char *name)
+{
+    u8 *nk = hv_at(h, nk_off, 0x4C), *nm;
+    u32 nl, i, n = (u32)strlen(name);
+    if (!nk || nk[0] != 'n' || nk[1] != 'k') return 0;
+    nl = le16(nk + 0x48);
+    if (!(nm = hv_at(h, nk_off, 0x4C + nl))) return 0;
+    nm += 0x4C;
+    if (le16(nk + 2) & 0x20) { /* nome em ASCII */
+        if (nl != n) return 0;
+        for (i = 0; i < n; i++)
+            if (tolower(nm[i]) != tolower((u8)name[i])) return 0;
+    } else { /* UTF-16 */
+        if (nl != 2 * n) return 0;
+        for (i = 0; i < n; i++)
+            if (le16(nm + 2 * i) > 127 || tolower(le16(nm + 2 * i)) != tolower((u8)name[i])) return 0;
+    }
+    return 1;
+}
+
+static u32 hv_find_list(Hive *h, u32 list, const char *name, int depth)
+{
+    u8 *l = hv_at(h, list, 4);
+    u32 cnt, i, step, r;
+    if (!l || depth > 4) return 0;
+    cnt = le16(l + 2);
+    if (l[0] == 'r' && l[1] == 'i') {
+        if (!hv_at(h, list, 4 + 4 * cnt)) return 0;
+        for (i = 0; i < cnt; i++)
+            if ((r = hv_find_list(h, le32(l + 4 + 4 * i), name, depth + 1))) return r;
+        return 0;
+    }
+    if (l[0] == 'l' && l[1] == 'i') step = 4;
+    else if (l[0] == 'l' && (l[1] == 'f' || l[1] == 'h')) step = 8;
+    else return 0;
+    if (!hv_at(h, list, 4 + step * cnt)) return 0;
+    for (i = 0; i < cnt; i++) {
+        u32 c = le32(l + 4 + step * i);
+        if (hv_name_is(h, c, name)) return c;
+    }
+    return 0;
+}
+
+static u32 hv_sub(Hive *h, u32 nk, const char *name)
+{
+    u8 *n = hv_at(h, nk, 0x4C);
+    if (!n || n[0] != 'n' || n[1] != 'k' || le32(n + 0x14) == 0) return 0;
+    return hv_find_list(h, le32(n + 0x1C), name, 0);
+}
+
+static u32 hv_path(Hive *h, u32 nk, const char *path)
+{
+    char comp[128];
+    while (*path && nk) {
+        int n = 0;
+        while (*path && *path != '\\' && n < 127) comp[n++] = *path++;
+        comp[n] = 0;
+        if (*path == '\\') path++;
+        nk = hv_sub(h, nk, comp);
+    }
+    return nk;
+}
+
+/* percorre os valores REG_DWORD de uma chave; name = NULL para todos.
+   Devolve quantos encontrou; offs/vals recebem a posicao no ARQUIVO e o valor. */
+static int hv_dwords(Hive *h, u32 nk, const char *name, u64 *offs, u32 *vals, int max)
+{
+    u8 *n = hv_at(h, nk, 0x4C), *vl;
+    u32 cnt, i;
+    int found = 0;
+    if (!n || n[0] != 'n' || n[1] != 'k') return 0;
+    cnt = le32(n + 0x24);
+    if (!cnt || cnt > 100000 || !(vl = hv_at(h, le32(n + 0x28), 4 * cnt))) return 0;
+    for (i = 0; i < cnt && found < max; i++) {
+        u32 vo = le32(vl + 4 * i), nl, sz, doff;
+        u8 *vk = hv_at(h, vo, 0x14), *nm;
+        if (!vk || vk[0] != 'v' || vk[1] != 'k') continue;
+        nl = le16(vk + 2);
+        sz = le32(vk + 4);
+        if (le32(vk + 0x0C) != 4 || (sz & 0x7FFFFFFFu) != 4) continue; /* REG_DWORD de 4 bytes */
+        if (!(nm = hv_at(h, vo, 0x14 + nl))) continue;
+        if (name) {
+            u32 k, L = (u32)strlen(name);
+            if (!(le16(vk + 0x10) & 1) || nl != L) continue; /* nomes de valores procurados sao ASCII */
+            for (k = 0; k < L && tolower(nm[0x14 + k]) == tolower((u8)name[k]); k++)
+                ;
+            if (k != L) continue;
+        }
+        if (sz & 0x80000000u) { /* dado guardado dentro do proprio vk */
+            offs[found] = 0x1000ull + vo + 4 + 8;
+        } else {
+            doff = le32(vk + 8);
+            if (!hv_at(h, doff, 4)) continue;
+            offs[found] = 0x1000ull + doff + 4;
+        }
+        vals[found] = le32(h->b + offs[found]);
+        found++;
+    }
+    return found;
+}
+
+typedef struct {
+    u64 off;
+    u32 val;
+} Patch;
+
+static const char *g_hw_services[] = {"atapi", "intelide", "pciide", "msahci", "iaStorV", "storahci", "stornvme", NULL};
+
+/* calcula as alteracoes num registro SYSTEM carregado em memoria */
+static int hwfix_hive(Hive *h, Patch *pt, int max, int *np, int *os)
+{
+    u32 root, cs, svc, k;
+    int n, i, j, sets = 0;
+    char nm[32];
+    *np = 0;
+    *os = 0;
+    if (h->len < 0x2000 || memcmp(h->b, "regf", 4) != 0) return -1;
+    root = le32(h->b + 0x24);
+    for (n = 1; n <= 20; n++) {
+        snprintf(nm, sizeof(nm), "ControlSet%03d", n);
+        if (!(cs = hv_sub(h, root, nm)) || !(svc = hv_sub(h, cs, "Services"))) continue;
+        sets++;
+        if (!*os) *os = hv_sub(h, svc, "storahci") ? 3 : hv_sub(h, svc, "msahci") ? 2 : 1;
+        for (i = 0; g_hw_services[i]; i++) {
+            u64 offs[64];
+            u32 vals[64], so;
+            int c;
+            if (!(k = hv_sub(h, svc, g_hw_services[i]))) continue;
+            if (hv_dwords(h, k, "Start", offs, vals, 1) == 1 && vals[0] != 0 && *np < max) {
+                printf("    %s\\Services\\%s: Start %u -> 0 (inicia no boot)\n", nm, g_hw_services[i], vals[0]);
+                pt[*np].off = offs[0];
+                pt[(*np)++].val = 0;
+            }
+            if ((so = hv_sub(h, k, "StartOverride")) && (c = hv_dwords(h, so, NULL, offs, vals, 64)) > 0)
+                for (j = 0; j < c; j++)
+                    if (vals[j] != 0 && *np < max) {
+                        printf("    %s\\Services\\%s\\StartOverride: %u -> 0\n", nm, g_hw_services[i], vals[j]);
+                        pt[*np].off = offs[j];
+                        pt[(*np)++].val = 0;
+                    }
+        }
+        if (*os == 1) {
+            u32 cd = hv_path(h, cs, "Control\\CriticalDeviceDatabase");
+            if (cd && !hv_sub(h, cd, "pci#cc_0101"))
+                printf("    AVISO: %s sem a entrada generica de controladora IDE (pci#cc_0101) no\n"
+                       "    CriticalDeviceDatabase; num PC muito diferente o XP ainda pode precisar do MergeIDE.\n", nm);
+        }
+    }
+    return sets ? 0 : -1;
+}
+
+/* procura instalacoes do Windows no disco e aplica a correcao. Devolve quantas preparou. */
+static int hwfix_disk(Dev *d)
+{
+    static const char *cands[] = {"Windows/System32/config/SYSTEM", "WINNT/system32/config/system", NULL};
+    PTable *t = malloc(sizeof(PTable));
+    int i, c, done = 0;
+    if (!t) return 0;
+    if (list_parts(d, t) != 0) {
+        printf("  Tabela de particoes nao reconhecida.\n");
+        free(t);
+        return 0;
+    }
+    for (i = 0; i < t->n; i++) {
+        Fs fs;
+        if (fs_open(&fs, d, t->p[i].start, t->p[i].len) != 0) continue;
+        for (c = 0; cands[c]; c++) {
+            DirEnt e;
+            FMap m;
+            const char *why = NULL;
+            Hive h;
+            Patch pt[256];
+            int np = 0, os = 0, k, ok = 1;
+            if (fs_lookup(&fs, cands[c], &e) != 0 || e.is_dir) continue;
+            printf("  Windows encontrado na particao em %llu MB (pasta \\%s)\n",
+                   (unsigned long long)(t->p[i].start >> 20), c == 0 ? "Windows" : "WINNT");
+            if (fs_fmap(&fs, &e, &m, &why) != 0 || m.resident || m.init_size < m.size || m.size > 512u * 1024 * 1024) {
+                printf("    AVISO: o arquivo do registro esta num formato que nao pode ser alterado%s%s.\n",
+                       why ? ": " : "", why ? why : "");
+                fm_free(&m);
+                continue;
+            }
+            h.len = m.size;
+            h.b = malloc((size_t)h.len + 8);
+            if (!h.b || fm_read(d, &m, 0, h.len, h.b) != 0) {
+                printf("    AVISO: nao foi possivel ler o registro.\n");
+                free(h.b);
+                fm_free(&m);
+                continue;
+            }
+            if (le32(h.b + 4) != le32(h.b + 8))
+                printf("    Obs.: o registro tem alteracoes pendentes de gravacao (desligamento sem\n"
+                       "    finalizar). A correcao foi aplicada, mas o Windows pode desfaze-la ao iniciar.\n");
+            if (hwfix_hive(&h, pt, 256, &np, &os) != 0) {
+                printf("    AVISO: registro SYSTEM nao reconhecido.\n");
+                free(h.b);
+                fm_free(&m);
+                continue;
+            }
+            for (k = 0; k < np; k++) {
+                u64 da, db;
+                u8 v[4], back[4];
+                put32(v, pt[k].val);
+                if (fm_locate(&m, pt[k].off, &da) != 0 || fm_locate(&m, pt[k].off + 3, &db) != 0 || db != da + 3 ||
+                    dev_write_any(d, da, 4, v) != 0 || dev_read_any(d, da, 4, back) != 0 || memcmp(back, v, 4) != 0) {
+                    ok = 0;
+                    break;
+                }
+            }
+            printf("    %s: %d alteracao(oes) %s.\n",
+                   os == 3 ? "Windows 8/10/11" : os == 2 ? "Windows Vista/7" : "Windows XP/2000/2003", np,
+                   !ok ? "-- FALHA AO GRAVAR" : np ? "gravada(s)" : "(ja estava preparado)");
+            if (os == 1)
+                printf("    Dica: se o PC novo usa SATA em modo AHCI, mude no BIOS para IDE/Compativel\n"
+                       "    (o XP nao tem driver AHCI proprio). Ex.: \"SATA Mode: IDE\".\n");
+            else if (os == 2)
+                printf("    Obs.: o Windows 7 nao tem driver NVMe proprio; para SSD NVMe instale a\n"
+                       "    atualizacao KB2990941 antes do backup (ou use SATA).\n");
+            if (ok) done++;
+            free(h.b);
+            fm_free(&m);
+        }
+        fs_close(&fs);
+    }
+    free(t);
+    if (!done) printf("  Nenhuma instalacao do Windows foi preparada.\n");
+    return done;
+}
+
+/* prepara um disco ja restaurado/clonado para outro hardware */
+#ifdef HDCLONE_GUI
+__attribute__((unused))
+#endif
+static void cmd_hwfix(const char *dst, Opts *o)
+{
+    Dev d;
+    int n;
+    if (dev_open(&d, dst, 1) != 0) die("nao foi possivel abrir o disco (execute como Administrador)");
+    if (d.is_device && !d.size) die("nao foi possivel obter o tamanho do disco");
+    if (!d.is_device) {
+#ifndef _WIN32
+        struct stat st;
+        if (fstat(d.fd, &st) == 0) d.size = (u64)st.st_size;
+#endif
+    }
+    printf("\nDisco: %s\n", d.name);
+    if (d.disknum >= 0) {
+        printf("Desmontando volumes...\n");
+        if (lock_disk_volumes(d.disknum, 1) > 0 && !o->force)
+            die("ha volumes em uso neste disco (o disco do Windows em uso nao pode ser alterado; use outro PC ou boot por pendrive)");
+    }
+    printf("\nPreparando o Windows para funcionar em outro hardware...\n");
+    n = hwfix_disk(&d);
+#ifdef _WIN32
+    if (d.is_device) {
+        DWORD br;
+        FlushFileBuffers(d.h);
+        DeviceIoControl(d.h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &br, NULL);
+    }
+#endif
+    unlock_all();
+    dev_close(&d);
+    if (!n) die("nenhuma instalacao do Windows foi preparada");
+    printf("\nPronto.\n");
 }
 
 /* ---- restauracao / verificacao em pipeline ---- */
@@ -3947,6 +4787,10 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
     printf("\n\nFinalizando...\n");
     if (pl) apply_shrink(&d, pl);
     if (d.size != h.size) fix_gpt(&d);
+    if (o->hwfix) {
+        printf("\nPreparando o Windows para funcionar em outro hardware...\n");
+        hwfix_disk(&d);
+    }
 #ifdef _WIN32
     if (d.is_device) {
         DWORD br;
@@ -3967,6 +4811,210 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
 }
 
 /* ------------------------------------------------------------------ */
+/* CLONE: disco -> disco, sem imagem intermediaria                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    BkCtx bk;   /* primeiro campo: bk_produce le o disco de origem com o mesmo codigo do backup */
+    Dev *t;
+    u64 limit;
+    u8 *zeros;
+    u32 *crc;   /* CRC de cada bloco gravado inteiro (para a verificacao) */
+    u8 *wrote;
+} ClCtx;
+
+static int cl_work(Pipe *p, Slot *sl, int w)
+{
+    (void)p;
+    (void)w;
+    if (sl->type == T_PENDING) sl->crc = (u32)crc32(0, sl->buf, sl->len);
+    return 0;
+}
+
+static int cl_consume(Pipe *p, Slot *sl)
+{
+    ClCtx *c = p->ctx;
+    u64 off = sl->idx * CHUNK_SIZE;
+    const u8 *data = NULL;
+    if (sl->type == T_PENDING) data = sl->buf;
+    else if (sl->type == CH_ZERO || (sl->type == CH_FREE && c->bk.o->zero_free)) data = c->zeros;
+    if (data && off < c->limit) {
+        u32 n = off + sl->len > c->limit ? (u32)(c->limit - off) : sl->len;
+        if (dev_pwrite(c->t, data, n, off) != 0) {
+            char msg[200];
+            snprintf(msg, sizeof(msg), "falha de escrita no disco de destino na posicao %llu MB",
+                     (unsigned long long)(off >> 20));
+            pipe_fail(p, msg);
+            return -1;
+        }
+        if (n == sl->len) {
+            c->crc[sl->idx] = data == c->zeros ? (u32)crc32(0, c->zeros, n) : sl->crc;
+            c->wrote[sl->idx] = 1;
+        }
+    }
+    if (sl->type == T_PENDING) c->bk.used += sl->len;
+    p->done_bytes += sl->len;
+    return 0;
+}
+
+static void cmd_clone(const char *src, const char *dst, Opts *o)
+{
+    Dev sd, td;
+    Plan *pl = NULL;
+    static Plan plan;
+    u64 T, nchunks, i;
+    char s1[32], s2[32], msg[1400];
+    Pipe pp;
+    ClCtx cc;
+    int rc;
+
+    if (dev_open(&sd, src, 0) != 0) die("nao foi possivel abrir o disco de origem (execute como Administrador)");
+    if (dev_open(&td, dst, 1) != 0) die("nao foi possivel abrir o disco de destino (execute como Administrador)");
+    if ((sd.disknum >= 0 && sd.disknum == td.disknum) || !strcmp(sd.name, td.name))
+        die("origem e destino sao o mesmo disco");
+#ifdef _WIN32
+    if (td.disknum >= 0 && td.disknum == system_disk()) die("o disco de destino e o disco do Windows em uso");
+#endif
+    if (!sd.size) die("nao foi possivel obter o tamanho do disco de origem");
+    T = td.size;
+    if (!td.is_device && (td.size == 0 || td.size >= sd.size)) T = sd.size;
+    fmt_size(sd.size, s1);
+    fmt_size(T, s2);
+    printf("\nOrigem : %s  (%s, setor %u bytes)\n", sd.name, s1, sd.sector);
+    printf("Destino: %s  (%s)\n", td.name, s2);
+    if (td.is_device && td.sector != sd.sector) {
+        printf("\nAVISO: tamanho de setor diferente (origem %u, destino %u). As particoes\n"
+               "provavelmente NAO funcionarao no destino.\n", sd.sector, td.sector);
+        if (!o->force) die("use --force para clonar mesmo assim");
+    }
+
+    g_vss_used = 0;
+#ifdef _WIN32
+    if (sd.disknum >= 0 && !o->no_vss) {
+#else
+    if (getenv("HDCLONE_TEST_SNAP") && !o->no_vss) {
+#endif
+        printf("\nVSS (copia consistente com o Windows ligado):\n");
+        if (vss_begin(sd.disknum) == 0) {
+            sd.use_snap = 1;
+            g_vss_used = 1;
+        } else {
+            printf("  AVISO: VSS indisponivel - %s\n", g_vss_note);
+        }
+    }
+    if (!o->raw) {
+        printf("\nAnalisando particoes da origem...\n");
+        g_keep_sys = o->keep_sys;
+        reset_areas();
+        scan_partitions(&sd);
+    }
+    if (T < sd.size) {
+        printf("\nDestino menor que a origem. Conferindo se os dados cabem...\n");
+        plan_shrink(&sd, T, &plan); /* aborta aqui, sem gravar nada, se nao couber */
+        pl = &plan;
+    }
+    if (!o->yes) {
+        snprintf(msg, sizeof(msg), "\nATENCAO: TODO o conteudo de %s sera APAGADO e substituido pela copia de %s!",
+                 td.name, sd.name);
+        if (!confirm(msg)) die("Cancelado.");
+    }
+    if (td.disknum >= 0) {
+        printf("\nDesmontando volumes do destino...\n");
+        if (lock_disk_volumes(td.disknum, 1) > 0 && !o->force)
+            die("ha volumes em uso no disco de destino (feche programas/janelas ou use --force)");
+    }
+    if (sd.disknum >= 0) {
+        printf("\nBloqueando volumes da origem sem snapshot...\n");
+        if (lock_disk_volumes(sd.disknum, 0) > 0 && !g_vss_used)
+            printf("  AVISO: ha volumes em uso. Arquivos abertos podem ficar inconsistentes na copia.\n");
+    }
+
+    nchunks = (sd.size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    memset(&cc, 0, sizeof(cc));
+    cc.bk.d = &sd;
+    cc.bk.o = o;
+    cc.t = &td;
+    cc.limit = T;
+    cc.zeros = xalloc(CHUNK_SIZE);
+    cc.crc = xalloc((size_t)nchunks * 4);
+    cc.wrote = xalloc((size_t)nchunks);
+    pipe_init(&pp, nchunks, sd.size);
+    pp.produce = bk_produce;
+    pp.work = cl_work;
+    pp.consume = cl_consume;
+    pp.ctx = &cc;
+    printf("\nClonando...\n");
+    rc = pipe_run(&pp);
+    pipe_free(&pp);
+    if (rc != 0) die(pp.err);
+    fmt_size(cc.bk.used, s1);
+    printf("\n  Dados copiados: %s", s1);
+    if (cc.bk.nfree) printf("   espaco livre ignorado: %llu MB", (unsigned long long)cc.bk.nfree);
+    printf("\n");
+    if (cc.bk.bad) printf("  ATENCAO: %llu setores ilegiveis na origem foram gravados como zero!\n",
+                          (unsigned long long)cc.bk.bad);
+
+    if (o->verify) { /* antes dos ajustes finais, que alteram alguns setores de proposito */
+        u8 *buf = xalloc(CHUNK_SIZE);
+        printf("\nVerificando o disco de destino (lendo de volta)...\n");
+        g_t0 = g_tlast = now_ms();
+        for (i = 0; i < nchunks; i++) {
+            u64 off = i * CHUNK_SIZE;
+            u32 len = (u32)((sd.size - off) < CHUNK_SIZE ? (sd.size - off) : CHUNK_SIZE);
+            if (g_cancel) die("Operacao cancelada pelo usuario.");
+            if (cc.wrote[i] && (dev_pread(&td, buf, len, off) != 0 || (u32)crc32(0, buf, len) != cc.crc[i])) {
+                snprintf(msg, sizeof(msg), "o disco de destino NAO confere na posicao %llu MB (disco com defeito?)",
+                         (unsigned long long)(off >> 20));
+                die(msg);
+            }
+            progress(off + len, sd.size, i + 1 == nchunks);
+        }
+        xfree(buf);
+        printf("\n  Disco de destino conferido: todos os blocos gravados estao corretos.\n");
+    }
+
+    if (!td.is_device) {
+#ifdef _WIN32
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)T;
+        if (td.size < T) { SetFilePointerEx(td.h, li, NULL, FILE_BEGIN); SetEndOfFile(td.h); }
+#else
+        if (td.size < T && ftruncate(td.fd, (off_t)T) != 0) die("falha ao ajustar tamanho do arquivo");
+#endif
+        td.size = td.size > T ? td.size : T;
+    }
+    printf("\nFinalizando...\n");
+    if (pl) apply_shrink(&td, pl);
+    if (td.size != sd.size) fix_gpt(&td);
+    if (o->hwfix) {
+        printf("\nPreparando o Windows para funcionar em outro hardware...\n");
+        hwfix_disk(&td);
+    }
+#ifdef _WIN32
+    if (td.is_device) {
+        DWORD br;
+        FlushFileBuffers(td.h);
+        DeviceIoControl(td.h, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &br, NULL);
+    }
+#endif
+    unlock_all();
+    vss_end(1);
+    dev_close(&sd);
+    dev_close(&td);
+    xfree(cc.zeros);
+    xfree(cc.crc);
+    xfree(cc.wrote);
+    reset_areas();
+    g_shrunk = pl && pl->has_part;
+    printf("\nClone concluido!\n");
+    if (g_vss_used) printf("Copia consistente feita via VSS.\n");
+    if (g_shrunk) printf("A ultima particao foi reduzida para caber no destino (chkdsk no primeiro boot e normal).\n");
+    if (td.size > sd.size) printf("O destino e maior: o espaco extra ficou nao alocado (use Estender volume).\n");
+    printf("IMPORTANTE: antes de dar boot pelo disco novo, desligue o PC e remova (ou desconecte) o\n"
+           "disco antigo. Com os dois ligados, o Windows pode confundir os discos, que sao identicos.\n");
+}
+
+/* ------------------------------------------------------------------ */
 /* interface                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -3979,10 +5027,13 @@ static void usage(void)
         "  hdclone list                         lista os discos fisicos\n"
         "  hdclone backup  <disco> <img.hdc>    cria imagem do disco\n"
         "  hdclone restore <img.hdc> <disco>    grava a imagem em um disco\n"
+        "  hdclone clone   <origem> <destino>   copia um disco direto para outro\n"
         "  hdclone verify  <img.hdc>            confere a integridade da imagem\n"
         "  hdclone info    <img.hdc>            mostra informacoes da imagem\n"
         "  hdclone ls      <img.hdc> [N [pasta]]           lista particoes / pastas da imagem\n"
-        "  hdclone extract <img.hdc> N <caminho> <destino> copia arquivo/pasta da imagem\n\n"
+        "  hdclone extract <img.hdc> N <caminho> <destino> copia arquivo/pasta da imagem\n"
+        "  hdclone find    <img.hdc> N <nome> [pasta]      procura arquivos (aceita * e ?)\n"
+        "  hdclone hwfix   <disco>              prepara o Windows de um disco para outro PC\n\n"
         "<disco> = numero mostrado em 'list' (ex.: 1) ou caminho de arquivo/dispositivo.\n\n"
         "Opcoes de backup:\n"
         "  -c N         nivel de compressao zstd: 1 (rapido) a 19 (menor). Padrao: 3\n"
@@ -3992,6 +5043,7 @@ static void usage(void)
         "  -s MB        dividir a imagem em partes de MB megabytes. Padrao: 4000\n"
         "               (cabe em pendrive FAT32). Use -s 0 para arquivo unico.\n"
         "  --raw        copia setor a setor, inclusive espaco livre\n"
+        "  --verify     ao terminar, le a imagem de volta e confere todos os blocos\n"
         "  --keep-sys   copiar tambem pagefile.sys/hiberfil.sys/swapfile.sys (por padrao\n"
         "               ficam de fora: o Windows recria esses arquivos)\n"
         "  --no-vss     nao usar VSS (copia de sombra). Por padrao o VSS e usado para\n"
@@ -3999,6 +5051,7 @@ static void usage(void)
         "Opcoes de restore:\n"
         "  -y           nao pedir confirmacao\n"
         "  --zero-free  grava zeros no espaco livre (mais lento, apaga dados antigos)\n"
+        "  --hwfix      prepara o Windows para outro hardware (evita tela azul 0x7B)\n"
         "  --force      ignora avisos (volumes em uso, setor diferente)\n\n"
         "Exemplos:\n"
         "  hdclone backup 1 E:\\backup\\pc-sala.hdc\n"
@@ -4085,6 +5138,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-y")) o.yes = 1;
         else if (!strcmp(argv[i], "--force")) o.force = 1;
         else if (!strcmp(argv[i], "--zero-free")) o.zero_free = 1;
+        else if (!strcmp(argv[i], "--verify")) o.verify = 1;
+        else if (!strcmp(argv[i], "--hwfix")) o.hwfix = 1;
         else if (!strcmp(argv[i], "--no-vss")) o.no_vss = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help") || !strcmp(argv[i], "/?")) { usage(); return 0; }
         else if (!strcmp(argv[i], "--keep-sys")) o.keep_sys = 1;
@@ -4101,6 +5156,9 @@ int main(int argc, char **argv)
     else if (np == 2 && !strcmp(pos[0], "info")) cmd_info(pos[1]);
     else if (np >= 2 && np <= 4 && !strcmp(pos[0], "ls")) cmd_ls(pos[1], np > 2 ? pos[2] : NULL, np > 3 ? pos[3] : NULL);
     else if (np == 5 && !strcmp(pos[0], "extract")) cmd_extract(pos[1], pos[2], pos[3], pos[4]);
+    else if (np == 2 && !strcmp(pos[0], "hwfix")) cmd_hwfix(pos[1], &o);
+    else if (np == 3 && !strcmp(pos[0], "clone")) cmd_clone(pos[1], pos[2], &o);
+    else if ((np == 4 || np == 5) && !strcmp(pos[0], "find")) cmd_find(pos[1], pos[2], pos[3], np == 5 ? pos[4] : NULL);
     else { usage(); return 1; }
     return 0;
 }

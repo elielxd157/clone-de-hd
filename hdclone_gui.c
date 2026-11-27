@@ -21,6 +21,7 @@
 
 enum {
     ID_MODE_BACKUP = 100, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_KEEPSYS,
+    ID_MODE_CLONE, ID_TARGET, ID_VERIFY, ID_HWFIX,
     ID_LBL_DISK, ID_REFRESH, ID_LIST,
     ID_LBL_IMG, ID_PATH, ID_BROWSE, ID_IMGINFO,
     ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE, ID_VSS,
@@ -35,6 +36,7 @@ enum {
 #define MODE_RESTORE 1
 #define MODE_VERIFY 2
 #define MODE_EXPLORE 3
+#define MODE_CLONE 4
 
 typedef struct {
     int mode;
@@ -49,7 +51,7 @@ typedef struct {
     unsigned long eta;
 } Prog;
 
-static HWND g_hwnd, g_list, g_log, g_prog, g_status, g_path, g_imginfo, g_comp;
+static HWND g_hwnd, g_list, g_log, g_prog, g_status, g_path, g_imginfo, g_comp, g_target;
 static HFONT g_font, g_bold;
 static int g_mode = MODE_BACKUP;
 static int g_running, g_close_after, g_job_sysdisk;
@@ -118,6 +120,7 @@ static DWORD WINAPI worker(LPVOID arg)
     if (setjmp(g_jmp) == 0) {
         if (j->mode == MODE_BACKUP) cmd_backup(j->disk, j->path, &j->o);
         else if (j->mode == MODE_RESTORE) cmd_restore(j->path, j->disk, &j->o);
+        else if (j->mode == MODE_CLONE) cmd_clone(j->disk, j->path, &j->o);
         else if (j->mode == MODE_EXPLORE) {
             printf("Abrindo a imagem para recuperar arquivos...\n");
             open_virtual(j->path);
@@ -208,6 +211,10 @@ static void update_imginfo(void)
     Hdr h;
     int r;
     if (g_mode == MODE_BACKUP) { SetWindowTextW(g_imginfo, L""); return; }
+    if (g_mode == MODE_CLONE) {
+        SetWindowTextW(g_imginfo, L"O destino pode ser maior ou menor que a origem (se os dados couberem).");
+        return;
+    }
     {   /* sem caixas de erro aqui: le o texto direto */
         wchar_t w[MAX_PATH * 2];
         GetWindowTextW(g_path, w, MAX_PATH * 2);
@@ -236,6 +243,7 @@ static void refresh_disks(void)
     LVITEMW it;
     HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
     ListView_DeleteAllItems(g_list);
+    SendMessageW(g_target, CB_RESETCONTENT, 0, 0);
     g_ndisks = 0;
     for (n = 0; n < 32; n++) {
         DiskInfo *d = &g_disks[g_ndisks];
@@ -255,6 +263,16 @@ static void refresh_disks(void)
         MultiByteToWideChar(CP_ACP, 0, d->letters[0] ? d->letters : "-", -1, t, 160);
         ListView_SetItemText(g_list, i, 3, t);
         ListView_SetItemText(g_list, i, 4, d->is_system ? L"Windows em uso" : L"");
+        {
+            wchar_t c[300], sz[32], md[160], lt[160];
+            int k;
+            fmt_sizew(d->size, sz);
+            MultiByteToWideChar(CP_ACP, 0, d->model[0] ? d->model : "(desconhecido)", -1, md, 160);
+            MultiByteToWideChar(CP_ACP, 0, d->letters[0] ? d->letters : "-", -1, lt, 160);
+            swprintf(c, 300, L"Disco %d  -  %ls  -  %ls  (%ls)%ls", n, sz, md, lt, d->is_system ? L"  [Windows em uso]" : L"");
+            k = (int)SendMessageW(g_target, CB_ADDSTRING, 0, (LPARAM)c);
+            SendMessageW(g_target, CB_SETITEMDATA, k, g_ndisks);
+        }
         g_ndisks++;
     }
     SetCursor(old);
@@ -281,34 +299,44 @@ static void set_mode(int m)
         L"1.  Escolha o disco de ORIGEM (o que será copiado):",
         L"2.  Escolha o disco de DESTINO (será totalmente apagado!):",
         L"(não é necessário escolher disco para verificar)",
-        L"(não é necessário escolher disco para recuperar arquivos)"};
+        L"(não é necessário escolher disco para recuperar arquivos)",
+        L"1.  Escolha o disco de ORIGEM (o que será copiado):"};
     static const wchar_t *lbl_img[] = {
         L"2.  Onde salvar a imagem:",
         L"1.  Arquivo de imagem a restaurar (.hdc):",
         L"Arquivo de imagem a verificar (.hdc):",
-        L"Imagem (.hdc) de onde recuperar arquivos:"};
+        L"Imagem (.hdc) de onde recuperar arquivos:",
+        L"2.  Disco de DESTINO (será totalmente apagado!):"};
+    int bk = m == MODE_BACKUP, rs = m == MODE_RESTORE, cl = m == MODE_CLONE;
     g_mode = m;
     SetDlgItemTextW(g_hwnd, ID_LBL_DISK, lbl_disk[m]);
     SetDlgItemTextW(g_hwnd, ID_LBL_IMG, lbl_img[m]);
-    EnableWindow(g_list, m == MODE_BACKUP || m == MODE_RESTORE);
-    EnableWindow(GetDlgItem(g_hwnd, ID_REFRESH), m == MODE_BACKUP || m == MODE_RESTORE);
-    EnableWindow(GetDlgItem(g_hwnd, ID_KEEPSYS), m == MODE_BACKUP);
-    EnableWindow(g_comp, m == MODE_BACKUP);
-    EnableWindow(GetDlgItem(g_hwnd, ID_LBL_COMP), m == MODE_BACKUP);
-    EnableWindow(GetDlgItem(g_hwnd, ID_SPLIT), m == MODE_BACKUP);
-    EnableWindow(GetDlgItem(g_hwnd, ID_RAW), m == MODE_BACKUP);
-    EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), m == MODE_RESTORE);
-    EnableWindow(GetDlgItem(g_hwnd, ID_VSS), m == MODE_BACKUP);
-    SetDlgItemTextW(g_hwnd, ID_START, m == MODE_BACKUP    ? L"Iniciar backup"
-                                      : m == MODE_RESTORE ? L"Iniciar restauração"
-                                      : m == MODE_VERIFY  ? L"Verificar"
-                                                          : L"Abrir imagem");
+    EnableWindow(g_list, bk || rs || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_REFRESH), bk || rs || cl);
+    ShowWindow(g_path, cl ? SW_HIDE : SW_SHOW);
+    ShowWindow(GetDlgItem(g_hwnd, ID_BROWSE), cl ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_target, cl ? SW_SHOW : SW_HIDE);
+    EnableWindow(g_target, cl);
+    EnableWindow(g_comp, bk);
+    EnableWindow(GetDlgItem(g_hwnd, ID_LBL_COMP), bk);
+    EnableWindow(GetDlgItem(g_hwnd, ID_SPLIT), bk);
+    EnableWindow(GetDlgItem(g_hwnd, ID_RAW), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), rs || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_VSS), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_KEEPSYS), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), rs || cl);
+    SetDlgItemTextW(g_hwnd, ID_START, bk   ? L"Iniciar backup"
+                                      : rs ? L"Iniciar restauração"
+                                      : cl ? L"Iniciar clone"
+                                      : m == MODE_VERIFY ? L"Verificar"
+                                                         : L"Abrir imagem");
     update_imginfo();
 }
 
 static void set_running(int r)
 {
-    int ids[] = {ID_MODE_BACKUP, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_PATH, ID_BROWSE, ID_START};
+    int ids[] = {ID_MODE_BACKUP, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_MODE_CLONE, ID_PATH, ID_BROWSE, ID_START};
     int i;
     g_running = r;
     for (i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) EnableWindow(GetDlgItem(g_hwnd, ids[i]), !r);
@@ -322,6 +350,9 @@ static void set_running(int r)
         EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_VSS), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_KEEPSYS), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), FALSE);
+        EnableWindow(g_target, FALSE);
     } else {
         set_mode(g_mode);
         SetWindowTextW(g_hwnd, APP_TITLE);
@@ -365,11 +396,11 @@ static void start(void)
     g_job.o.level = 6;
     g_job.o.split = 0;
 
-    if (g_mode == MODE_BACKUP || g_mode == MODE_RESTORE) {
+    if (g_mode == MODE_BACKUP || g_mode == MODE_RESTORE || g_mode == MODE_CLONE) {
         d = selected_disk();
         if (!d) {
-            msgbox(g_mode == MODE_BACKUP ? L"Selecione na lista o disco que será copiado."
-                                         : L"Selecione na lista o disco de destino.", MB_ICONINFORMATION);
+            msgbox(g_mode == MODE_RESTORE ? L"Selecione na lista o disco de destino."
+                                          : L"Selecione na lista o disco que será copiado.", MB_ICONINFORMATION);
             return;
         }
         sprintf(g_job.disk, "%d", d->num);
@@ -377,7 +408,7 @@ static void start(void)
         MultiByteToWideChar(CP_ACP, 0, d->model[0] ? d->model : "(desconhecido)", -1, model, 160);
         MultiByteToWideChar(CP_ACP, 0, d->letters[0] ? d->letters : "nenhuma", -1, letters, 160);
     }
-    if (!get_path(g_job.path, sizeof(g_job.path))) {
+    if (g_mode != MODE_CLONE && !get_path(g_job.path, sizeof(g_job.path))) {
         if (GetWindowTextLengthW(g_path) == 0)
             msgbox(g_mode == MODE_BACKUP ? L"Informe onde salvar a imagem (botão Procurar...)."
                                          : L"Escolha o arquivo de imagem (botão Procurar...).", MB_ICONINFORMATION);
@@ -395,6 +426,7 @@ static void start(void)
         g_job.o.raw = IsDlgButtonChecked(g_hwnd, ID_RAW) == BST_CHECKED;
         g_job.o.no_vss = IsDlgButtonChecked(g_hwnd, ID_VSS) != BST_CHECKED;
         g_job.o.keep_sys = IsDlgButtonChecked(g_hwnd, ID_KEEPSYS) != BST_CHECKED;
+        g_job.o.verify = IsDlgButtonChecked(g_hwnd, ID_VERIFY) == BST_CHECKED;
         if (!strchr(g_job.path, '.') || strrchr(g_job.path, '.') < strrchr(g_job.path, '\\')) {
             strcat(g_job.path, ".hdc");
         }
@@ -432,6 +464,7 @@ static void start(void)
             return;
         }
         g_job.o.zero_free = IsDlgButtonChecked(g_hwnd, ID_ZEROFREE) == BST_CHECKED;
+        g_job.o.hwfix = IsDlgButtonChecked(g_hwnd, ID_HWFIX) == BST_CHECKED;
         swprintf(t, 1200,
                  L"ATENÇÃO: TODOS OS DADOS DO DISCO ABAIXO SERÃO APAGADOS!\n\n"
                  L"    Disco %d  -  %ls\n    %ls\n    Unidades: %ls\n\n"
@@ -442,6 +475,41 @@ static void start(void)
                      ? L"\nO disco de destino é MENOR que o original: a última partição será reduzida, "
                        L"se os dados couberem. O hdclone confere isso antes de gravar; se não couber, "
                        L"ele avisa o tamanho mínimo e o disco não é alterado.\n\n"
+                     : L"");
+        if (MessageBoxW(g_hwnd, t, APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    } else if (g_mode == MODE_CLONE) {
+        int ti = (int)SendMessageW(g_target, CB_GETCURSEL, 0, 0);
+        DiskInfo *tg;
+        wchar_t tsz[32], tmodel[160], tlet[160];
+        if (ti < 0) { msgbox(L"Escolha o disco de DESTINO na lista abaixo da lista de discos.", MB_ICONINFORMATION); return; }
+        tg = &g_disks[SendMessageW(g_target, CB_GETITEMDATA, ti, 0)];
+        if (tg->num == d->num) { msgbox(L"Origem e destino são o mesmo disco.", MB_ICONERROR); return; }
+        if (tg->is_system) {
+            msgbox(L"O disco de destino é o disco do Windows que está em uso: não é possível gravar nele.",
+                   MB_ICONERROR);
+            return;
+        }
+        sprintf(g_job.path, "%d", tg->num);
+        g_job.o.raw = IsDlgButtonChecked(g_hwnd, ID_RAW) == BST_CHECKED;
+        g_job.o.no_vss = IsDlgButtonChecked(g_hwnd, ID_VSS) != BST_CHECKED;
+        g_job.o.keep_sys = IsDlgButtonChecked(g_hwnd, ID_KEEPSYS) != BST_CHECKED;
+        g_job.o.verify = IsDlgButtonChecked(g_hwnd, ID_VERIFY) == BST_CHECKED;
+        g_job.o.zero_free = IsDlgButtonChecked(g_hwnd, ID_ZEROFREE) == BST_CHECKED;
+        g_job.o.hwfix = IsDlgButtonChecked(g_hwnd, ID_HWFIX) == BST_CHECKED;
+        g_job_sysdisk = d->is_system;
+        fmt_sizew(tg->size, tsz);
+        MultiByteToWideChar(CP_ACP, 0, tg->model[0] ? tg->model : "(desconhecido)", -1, tmodel, 160);
+        MultiByteToWideChar(CP_ACP, 0, tg->letters[0] ? tg->letters : "nenhuma", -1, tlet, 160);
+        swprintf(t, 1200,
+                 L"ATENÇÃO: TODOS OS DADOS DO DISCO DE DESTINO SERÃO APAGADOS!\n\n"
+                 L"Origem:   Disco %d  -  %ls  -  %ls\n"
+                 L"Destino:  Disco %d  -  %ls  -  %ls\n               Unidades: %ls\n\n%ls"
+                 L"Esta operação não pode ser desfeita.\n\nTem certeza que deseja continuar?",
+                 d->num, sz, model, tg->num, tsz, tmodel, tlet,
+                 tg->size < d->size
+                     ? L"O destino é MENOR que a origem: a última partição será reduzida, se os dados "
+                       L"couberem. O hdclone confere isso antes de gravar; se não couber, ele avisa o "
+                       L"tamanho mínimo e o disco não é alterado.\n\n"
                      : L"");
         if (MessageBoxW(g_hwnd, t, APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     } else if (g_mode == MODE_EXPLORE) {
@@ -473,8 +541,8 @@ static void cancel(int ask)
 {
     if (!g_running) return;
     if (ask) {
-        const wchar_t *m = g_job.mode == MODE_RESTORE
-            ? L"Cancelar a restauração?\n\nO disco de destino ficará incompleto e não vai funcionar "
+        const wchar_t *m = g_job.mode == MODE_RESTORE || g_job.mode == MODE_CLONE
+            ? L"Cancelar?\n\nO disco de destino ficará incompleto e não vai funcionar "
               L"até ser restaurado novamente."
             : L"Cancelar a operação?";
         if (MessageBoxW(g_hwnd, m, APP_TITLE, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
@@ -501,10 +569,11 @@ static void create_controls(void)
     static const int widths[] = {70, 80, 230, 90, 110};
 
     ctl(L"BUTTON", L"O que deseja fazer?", BS_GROUPBOX, 10, 6, 620, 48, ID_GRP_MODE);
-    ctl(L"BUTTON", L"Backup (disco → imagem)", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 20, 26, 160, 20, ID_MODE_BACKUP);
-    ctl(L"BUTTON", L"Restaurar (imagem → disco)", BS_AUTORADIOBUTTON, 182, 26, 170, 20, ID_MODE_RESTORE);
-    ctl(L"BUTTON", L"Verificar imagem", BS_AUTORADIOBUTTON, 356, 26, 118, 20, ID_MODE_VERIFY);
-    ctl(L"BUTTON", L"Recuperar arquivos", BS_AUTORADIOBUTTON, 478, 26, 148, 20, ID_MODE_EXPLORE);
+    ctl(L"BUTTON", L"Backup", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 20, 26, 90, 20, ID_MODE_BACKUP);
+    ctl(L"BUTTON", L"Restaurar", BS_AUTORADIOBUTTON, 114, 26, 100, 20, ID_MODE_RESTORE);
+    ctl(L"BUTTON", L"Clonar disco", BS_AUTORADIOBUTTON, 218, 26, 110, 20, ID_MODE_CLONE);
+    ctl(L"BUTTON", L"Verificar imagem", BS_AUTORADIOBUTTON, 332, 26, 130, 20, ID_MODE_VERIFY);
+    ctl(L"BUTTON", L"Recuperar arquivos", BS_AUTORADIOBUTTON, 466, 26, 158, 20, ID_MODE_EXPLORE);
     CheckDlgButton(g_hwnd, ID_MODE_BACKUP, BST_CHECKED);
 
     ctl(L"STATIC", L"", SS_LEFT | WS_GROUP, 12, 66, 500, 18, ID_LBL_DISK);
@@ -522,6 +591,8 @@ static void create_controls(void)
     ctl(L"STATIC", L"", SS_LEFT, 12, 220, 500, 18, ID_LBL_IMG);
     g_path = ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 10, 240, 510, 24, ID_PATH);
     ctl(L"BUTTON", L"Procurar...", BS_PUSHBUTTON | WS_TABSTOP, 530, 240, 100, 24, ID_BROWSE);
+    g_target = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 10, 240, 620, 200, ID_TARGET);
+    ShowWindow(g_target, SW_HIDE);
     g_imginfo = ctl(L"STATIC", L"", SS_LEFT, 12, 268, 618, 18, ID_IMGINFO);
 
     ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 124, ID_GRP_OPT);
@@ -535,12 +606,12 @@ static void create_controls(void)
     SendMessageW(g_comp, CB_SETCURSEL, 1, 0);
     ctl(L"BUTTON", L"Dividir em partes de 4 GB (para pendrive FAT32)", BS_AUTOCHECKBOX | WS_TABSTOP, 290, 310, 330, 20, ID_SPLIT);
     CheckDlgButton(g_hwnd, ID_SPLIT, BST_CHECKED);
-    ctl(L"BUTTON", L"Copiar setor a setor (inclui espaço livre, imagem maior)", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 336, 330, 20, ID_RAW);
-    ctl(L"BUTTON", L"Zerar espaço livre no destino", BS_AUTOCHECKBOX | WS_TABSTOP, 400, 336, 220, 20, ID_ZEROFREE);
-    ctl(L"BUTTON", L"Usar VSS: copiar com o Windows ligado de forma consistente (recomendado)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 24, 362, 590, 20, ID_VSS);
-    ctl(L"BUTTON", L"Deixar de fora pagefile.sys e hiberfil.sys (o Windows recria; imagem bem menor)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 24, 388, 590, 20, ID_KEEPSYS);
+    ctl(L"BUTTON", L"Copiar setor a setor (inclui espaço livre)", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 336, 300, 20, ID_RAW);
+    ctl(L"BUTTON", L"Zerar espaço livre no destino", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 336, 284, 20, ID_ZEROFREE);
+    ctl(L"BUTTON", L"Usar VSS (copiar com o Windows ligado)", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 362, 300, 20, ID_VSS);
+    ctl(L"BUTTON", L"Verificar ao terminar (lê tudo de volta)", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 362, 284, 20, ID_VERIFY);
+    ctl(L"BUTTON", L"Deixar de fora pagefile.sys e hiberfil.sys", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 388, 300, 20, ID_KEEPSYS);
+    ctl(L"BUTTON", L"Preparar p/ outro PC (evita tela azul 0x7B)", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 388, 284, 20, ID_HWFIX);
     CheckDlgButton(g_hwnd, ID_KEEPSYS, BST_CHECKED);
     CheckDlgButton(g_hwnd, ID_VSS, BST_CHECKED);
 
@@ -571,6 +642,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case ID_MODE_RESTORE: set_mode(MODE_RESTORE); break;
         case ID_MODE_VERIFY: set_mode(MODE_VERIFY); break;
         case ID_MODE_EXPLORE: set_mode(MODE_EXPLORE); break;
+        case ID_MODE_CLONE: set_mode(MODE_CLONE); break;
         case ID_REFRESH: refresh_disks(); break;
         case ID_BROWSE: browse(); break;
         case ID_START: start(); break;
@@ -620,7 +692,23 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (g_close_after) DestroyWindow(h);
             return 0;
         }
-        if (ok) {
+        if (ok && (mode == MODE_CLONE || (mode == MODE_RESTORE && g_job.o.hwfix))) {
+            wchar_t t[1200];
+            SendMessageW(g_prog, PBM_SETPOS, 1000, 0);
+            SetWindowTextW(g_status, L"Concluído com sucesso.");
+            swprintf(t, 1200, L"%ls concluído com sucesso!%ls%ls%ls%ls%ls",
+                     mode == MODE_CLONE ? L"Clone" : L"Restauração",
+                     mode == MODE_CLONE && g_vss_used ? L"\n\nCópia consistente feita com VSS." : L"",
+                     g_job.o.verify ? L"\n\nO disco de destino foi lido de volta e conferido." : L"",
+                     g_shrunk ? L"\n\nA última partição foi reduzida para caber no disco; no primeiro boot o "
+                                L"Windows pode fazer uma verificação (chkdsk): deixe terminar." : L"",
+                     g_job.o.hwfix ? L"\n\nO Windows foi preparado para funcionar em outro hardware "
+                                     L"(veja os detalhes no registro abaixo)." : L"",
+                     mode == MODE_CLONE ? L"\n\nIMPORTANTE: antes de dar boot pelo disco novo, desligue o PC e "
+                                          L"remova (ou desconecte) o disco antigo. Com os dois ligados, o Windows "
+                                          L"pode confundir os discos, que são idênticos." : L"");
+            if (!g_close_after) msgbox(t, MB_ICONINFORMATION);
+        } else if (ok) {
             SendMessageW(g_prog, PBM_SETPOS, 1000, 0);
             SetWindowTextW(g_status, L"Concluído com sucesso.");
             if (!g_close_after && mode == MODE_BACKUP && !g_vss_used && g_job_sysdisk) {
@@ -632,11 +720,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 msgbox(t, MB_ICONWARNING);
             } else if (!g_close_after)
                 msgbox(mode == MODE_BACKUP
-                           ? (g_vss_used ? L"Backup concluído com sucesso!\n\nA cópia foi feita com VSS: a imagem "
-                                           L"é consistente mesmo com o Windows ligado.\n\nDica: use \"Verificar "
-                                           L"imagem\" para conferir o arquivo antes de precisar dele."
-                                         : L"Backup concluído com sucesso!\n\nDica: use \"Verificar imagem\" "
-                                           L"para conferir o arquivo antes de precisar dele.")
+                           ? (g_job.o.verify
+                                  ? (g_vss_used ? L"Backup concluído e imagem verificada!\n\nA cópia foi feita com "
+                                                  L"VSS (consistente com o Windows ligado) e a imagem foi lida de "
+                                                  L"volta e conferida.\n\nUm relatório (.log) foi salvo junto da imagem."
+                                                : L"Backup concluído e imagem verificada!\n\nUm relatório (.log) "
+                                                  L"foi salvo junto da imagem.")
+                                  : (g_vss_used ? L"Backup concluído com sucesso!\n\nA cópia foi feita com VSS: a "
+                                                  L"imagem é consistente mesmo com o Windows ligado.\n\nUm relatório "
+                                                  L"(.log) foi salvo junto da imagem."
+                                                : L"Backup concluído com sucesso!\n\nUm relatório (.log) foi salvo "
+                                                  L"junto da imagem. Dica: marque \"Verificar ao terminar\" para "
+                                                  L"conferir a imagem logo após o backup."))
                        : mode == MODE_RESTORE
                            ? (g_shrunk ? L"Restauração concluída com sucesso!\n\nA última partição foi reduzida "
                                          L"para caber no disco. No primeiro boot o Windows pode fazer uma "
@@ -653,7 +748,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 msgbox(t, g_cancel ? MB_ICONINFORMATION : MB_ICONERROR);
             }
         }
-        if (mode == MODE_RESTORE) refresh_disks();
+        if (mode == MODE_RESTORE || mode == MODE_CLONE) refresh_disks();
         if (g_close_after) DestroyWindow(h);
         return 0;
     }
@@ -679,13 +774,19 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* janela "Recuperar arquivos"                                         */
 /* ------------------------------------------------------------------ */
 
-enum { IDX_LBLVOL = 300, IDX_VOL, IDX_UP, IDX_WHERE, IDX_LIST, IDX_EXTRACT, IDX_XCANCEL, IDX_CLOSE, IDX_XPROG, IDX_XSTATUS };
+enum { IDX_LBLVOL = 300, IDX_VOL, IDX_UP, IDX_WHERE, IDX_LIST, IDX_EXTRACT, IDX_XCANCEL, IDX_CLOSE, IDX_XPROG, IDX_XSTATUS,
+       IDX_SEARCH, IDX_FIND };
 #define WM_APP_XDONE (WM_APP + 4)
+#define WM_APP_XFOUND (WM_APP + 5)
 #define X_TITLE L"hdclone - Recuperar arquivos"
 
-static HWND g_xlist, g_xvol, g_xwhere, g_xprog, g_xstatus;
-static Ntfs g_nt;
-static int g_nt_ok, g_xrunning, g_xclose_after;
+static HWND g_xlist, g_xvol, g_xwhere, g_xprog, g_xstatus, g_xsearch;
+static Fs g_fs;                /* particao aberta (NTFS ou FAT32) */
+static int g_fs_ok, g_xrunning, g_xclose_after;
+static int g_xres;             /* 1 = mostrando resultados de busca */
+static FoundList g_found;
+static u16 g_xq[300];
+static int g_xqn;
 static DirList g_cur;
 static u64 g_xrec[256];      /* pilha de pastas abertas */
 static int g_xlen[256];      /* tamanho do texto do caminho em cada nivel */
@@ -712,7 +813,9 @@ static void x_layout(void)
     MoveWindow(GetDlgItem(g_xw, IDX_LBLVOL), S(10), S(14), S(60), S(18), TRUE);
     MoveWindow(g_xvol, S(72), S(10), W - S(82), S(200), TRUE);
     MoveWindow(GetDlgItem(g_xw, IDX_UP), S(10), S(40), S(100), S(26), TRUE);
-    MoveWindow(g_xwhere, S(118), S(45), W - S(128), S(18), TRUE);
+    MoveWindow(g_xwhere, S(118), S(45), W - S(118) - S(330), S(18), TRUE);
+    MoveWindow(g_xsearch, W - S(320), S(41), S(210), S(24), TRUE);
+    MoveWindow(GetDlgItem(g_xw, IDX_FIND), W - S(104), S(40), S(94), S(26), TRUE);
     MoveWindow(g_xlist, S(10), S(72), W - S(20), H - S(72) - S(92), TRUE);
     MoveWindow(GetDlgItem(g_xw, IDX_EXTRACT), S(10), H - S(84), S(190), S(30), TRUE);
     MoveWindow(GetDlgItem(g_xw, IDX_XCANCEL), S(208), H - S(84), S(100), S(30), TRUE);
@@ -736,16 +839,22 @@ static int sys_icon(const DirEnt *e)
 
 static void x_fill(void)
 {
-    int i;
-    wchar_t t[300];
+    int i, cnt = g_xres ? g_found.n : g_cur.n;
+    wchar_t t[1100];
     SendMessageW(g_xlist, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_xlist);
-    for (i = 0; i < g_cur.n; i++) {
-        DirEnt *e = &g_cur.e[i];
+    for (i = 0; i < cnt; i++) {
+        DirEnt *e = g_xres ? &g_found.f[i].e : &g_cur.e[i];
         LVITEMW it;
         char dt[24];
-        int n = e->nlen < 255 ? e->nlen : 255, k;
-        memcpy(t, e->name, n * sizeof(wchar_t));
+        int n, k;
+        if (g_xres) { /* resultado de busca: mostra o caminho completo */
+            n = g_found.f[i].plen < 1000 ? g_found.f[i].plen : 1000;
+            memcpy(t, g_found.f[i].path, n * sizeof(wchar_t));
+        } else {
+            n = e->nlen < 255 ? e->nlen : 255;
+            memcpy(t, e->name, n * sizeof(wchar_t));
+        }
         t[n] = 0;
         memset(&it, 0, sizeof(it));
         it.mask = LVIF_TEXT | LVIF_PARAM | LVIF_IMAGE;
@@ -762,10 +871,25 @@ static void x_fill(void)
         ListView_SetItemText(g_xlist, k, 2, t);
     }
     SendMessageW(g_xlist, WM_SETREDRAW, TRUE, 0);
-    SetWindowTextW(g_xwhere, g_xpath);
-    EnableWindow(GetDlgItem(g_xw, IDX_UP), g_xdepth > 0);
-    swprintf(t, 300, L"%d itens. Dê dois cliques numa pasta para abri-la; selecione itens e clique em Extrair.",
-             g_cur.n);
+    if (g_xres) {
+        wchar_t q[300];
+        int n = g_xqn < 299 ? g_xqn : 299;
+        memcpy(q, g_xq, n * sizeof(wchar_t));
+        q[n] = 0;
+        swprintf(t, 1100, L"Resultados de \u201C%ls\u201D em %ls", q, g_xpath);
+        SetWindowTextW(g_xwhere, t);
+        SetDlgItemTextW(g_xw, IDX_UP, L"Voltar");
+        EnableWindow(GetDlgItem(g_xw, IDX_UP), TRUE);
+        swprintf(t, 1100, L"%d encontrado(s) em %llu pastas%ls. Selecione e clique em Extrair; dois cliques numa "
+                          L"pasta a abre.", g_found.n, (unsigned long long)g_found.dirs,
+                 g_found.truncated ? L" (lista cortada: refine a busca)" : L"");
+    } else {
+        SetWindowTextW(g_xwhere, g_xpath);
+        SetDlgItemTextW(g_xw, IDX_UP, L"Pasta acima");
+        EnableWindow(GetDlgItem(g_xw, IDX_UP), g_xdepth > 0);
+        swprintf(t, 1100, L"%d itens. Dois cliques numa pasta a abrem; selecione itens e clique em Extrair. "
+                          L"Para procurar, digite o nome acima.", g_cur.n);
+    }
     SetWindowTextW(g_xstatus, t);
 }
 
@@ -773,7 +897,7 @@ static int x_load(u64 rec)
 {
     DirList dl;
     HCURSOR old = SetCursor(LoadCursor(NULL, IDC_WAIT));
-    int r = nt_list(&g_nt, rec, &dl);
+    int r = fs_list(&g_fs, rec, &dl);
     SetCursor(old);
     if (r != 0) {
         MessageBoxW(g_xw, L"Não foi possível ler esta pasta (imagem danificada?).", X_TITLE, MB_ICONERROR);
@@ -781,31 +905,74 @@ static int x_load(u64 rec)
     }
     dl_free(&g_cur);
     g_cur = dl;
+    g_xres = 0;
     return 0;
 }
 
 static void x_open_volume(int k)
 {
-    if (g_nt_ok) nt_close(&g_nt);
-    g_nt_ok = 0;
+    if (g_fs_ok) fs_close(&g_fs);
+    g_fs_ok = 0;
+    g_xres = 0;
     dl_free(&g_cur);
+    found_free(&g_found);
     ListView_DeleteAllItems(g_xlist);
-    if (k < 0 || k >= g_nvols || nt_open(&g_nt, &g_vdev, g_vols[k].start, g_vols[k].len) != 0) {
+    if (k < 0 || k >= g_nvols || fs_open(&g_fs, &g_vdev, g_vols[k].start, g_vols[k].len) != 0) {
         MessageBoxW(g_xw, L"Não foi possível abrir esta partição.", X_TITLE, MB_ICONERROR);
         return;
     }
-    g_nt_ok = 1;
+    g_fs_ok = 1;
     g_xdepth = 0;
-    g_xrec[0] = 5; /* pasta raiz */
+    g_xrec[0] = fs_root(&g_fs); /* pasta raiz */
     wcscpy(g_xpath, L"\\");
     g_xlen[0] = 1;
-    if (x_load(5) == 0) x_fill();
+    if (x_load(g_xrec[0]) == 0) x_fill();
+}
+
+/* abre uma pasta pelo caminho completo (resultado de busca) */
+static void x_goto(const u16 *path, int plen)
+{
+    int i = 0;
+    u64 rec = fs_root(&g_fs);
+    g_xdepth = 0;
+    g_xrec[0] = rec;
+    wcscpy(g_xpath, L"\\");
+    g_xlen[0] = 1;
+    while (i < plen && g_xdepth < 254) {
+        DirList dl;
+        int s0, k, found = -1, n;
+        while (i < plen && path[i] == '\\') i++;
+        s0 = i;
+        while (i < plen && path[i] != '\\') i++;
+        if (i == s0) break;
+        if (fs_list(&g_fs, rec, &dl) != 0) break;
+        for (k = 0; k < dl.n; k++)
+            if (dl.e[k].is_dir && name_cmp(dl.e[k].name, dl.e[k].nlen, path + s0, i - s0) == 0) { found = k; break; }
+        if (found < 0) { dl_free(&dl); break; }
+        rec = dl.e[found].rec;
+        dl_free(&dl);
+        n = (int)wcslen(g_xpath);
+        if (n + (i - s0) + 2 >= 4096) break;
+        memcpy(g_xpath + n, path + s0, (i - s0) * sizeof(wchar_t));
+        g_xpath[n + (i - s0)] = L'\\';
+        g_xpath[n + (i - s0) + 1] = 0;
+        g_xdepth++;
+        g_xrec[g_xdepth] = rec;
+        g_xlen[g_xdepth] = n + (i - s0) + 1;
+    }
+    if (x_load(g_xrec[g_xdepth]) == 0) x_fill();
 }
 
 static void x_enter(int idx)
 {
     DirEnt *e;
     int n;
+    if (g_xres) {
+        if (idx < 0 || idx >= g_found.n || !g_found.f[idx].e.is_dir) return;
+        if (g_found.f[idx].e.attr & FA_REPARSE) return;
+        x_goto(g_found.f[idx].path, g_found.f[idx].plen);
+        return;
+    }
     if (idx < 0 || idx >= g_cur.n) return;
     e = &g_cur.e[idx];
     if (!e->is_dir) return;
@@ -835,6 +1002,11 @@ static void x_enter(int idx)
 
 static void x_up(void)
 {
+    if (g_xres) { /* sai dos resultados e volta para a pasta */
+        g_xres = 0;
+        x_fill();
+        return;
+    }
     if (g_xdepth == 0) return;
     if (x_load(g_xrec[g_xdepth - 1]) != 0) return;
     g_xdepth--;
@@ -847,18 +1019,59 @@ static void x_set_running(int r)
     g_xrunning = r;
     EnableWindow(GetDlgItem(g_xw, IDX_EXTRACT), !r);
     EnableWindow(GetDlgItem(g_xw, IDX_XCANCEL), r);
-    EnableWindow(GetDlgItem(g_xw, IDX_UP), !r && g_xdepth > 0);
+    EnableWindow(GetDlgItem(g_xw, IDX_UP), !r && (g_xdepth > 0 || g_xres));
     EnableWindow(g_xvol, !r);
     EnableWindow(g_xlist, !r);
+    EnableWindow(g_xsearch, !r);
+    EnableWindow(GetDlgItem(g_xw, IDX_FIND), !r);
 }
 
 static DWORD WINAPI xworker(LPVOID a)
 {
     (void)a;
-    if (setjmp(g_jmp) == 0) extract_entries(&g_nt, g_xsel, g_nxsel, g_xdest);
+    if (setjmp(g_jmp) == 0) extract_entries(&g_fs, g_xsel, g_nxsel, g_xdest);
     else g_xs.errors++; /* erro grave (ex.: memoria): a imagem foi fechada */
     PostMessageW(g_xw, WM_APP_XDONE, 0, 0);
     return 0;
+}
+
+static DWORD WINAPI xfworker(LPVOID a)
+{
+    FoundList fl;
+    (void)a;
+    memset(&fl, 0, sizeof(fl));
+    if (setjmp(g_jmp) == 0) find_files(&g_fs, g_xrec[g_xdepth], g_xq, g_xqn, &fl);
+    found_free(&g_found);
+    g_found = fl;
+    PostMessageW(g_xw, WM_APP_XFOUND, 0, 0);
+    return 0;
+}
+
+static void x_find(void)
+{
+    wchar_t q[300];
+    int i, n;
+    if (!g_fs_ok || g_xrunning) return;
+    n = GetWindowTextW(g_xsearch, q, 300);
+    while (n && q[n - 1] == L' ') n--;
+    for (i = 0; i < n && q[i] == L' '; i++)
+        ;
+    if (i >= n) {
+        MessageBoxW(g_xw, L"Digite o nome (ou parte do nome) a procurar.\n\nAceita curingas: *.doc, foto?.jpg",
+                    X_TITLE, MB_ICONINFORMATION);
+        return;
+    }
+    g_xqn = n - i;
+    memcpy(g_xq, q + i, g_xqn * sizeof(wchar_t));
+    g_cancel = 0;
+    x_set_running(1);
+    SetWindowTextW(g_xstatus, L"Procurando... (Cancelar interrompe)");
+    {
+        DWORD tid;
+        HANDLE th = CreateThread(NULL, 0, xfworker, NULL, 0, &tid);
+        if (!th) { x_set_running(0); return; }
+        CloseHandle(th);
+    }
 }
 
 static int CALLBACK browse_cb(HWND h, UINT msg, LPARAM lp, LPARAM data)
@@ -873,10 +1086,14 @@ static void x_extract(void)
     int i, n = ListView_GetSelectedCount(g_xlist);
     BROWSEINFOW bi;
     LPITEMIDLIST pidl;
-    if (!g_nt_ok) return;
+    if (!g_fs_ok) return;
     free(g_xsel);
     g_xsel = NULL;
     g_nxsel = 0;
+    if (n == 0 && g_xres) {
+        MessageBoxW(g_xw, L"Selecione na lista os itens encontrados que deseja extrair.", X_TITLE, MB_ICONINFORMATION);
+        return;
+    }
     if (n == 0) {
         if (MessageBoxW(g_xw, L"Nenhum item selecionado.\n\nExtrair a pasta atual inteira?", X_TITLE,
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
@@ -905,7 +1122,7 @@ static void x_extract(void)
             it.mask = LVIF_PARAM;
             it.iItem = k;
             SendMessageW(g_xlist, LVM_GETITEMW, 0, (LPARAM)&it);
-            g_xsel[g_nxsel++] = g_cur.e[it.lParam];
+            g_xsel[g_nxsel++] = g_xres ? g_found.f[it.lParam].e : g_cur.e[it.lParam];
         }
     }
     memset(&bi, 0, sizeof(bi));
@@ -948,6 +1165,9 @@ static LRESULT CALLBACK xproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         g_xvol = xctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, IDX_VOL);
         xctl(L"BUTTON", L"Pasta acima", BS_PUSHBUTTON | WS_TABSTOP, IDX_UP);
         g_xwhere = xctl(L"STATIC", L"\\", SS_LEFT | SS_PATHELLIPSIS, IDX_WHERE);
+        g_xsearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                    0, 0, 10, 10, h, (HMENU)(INT_PTR)IDX_SEARCH, GetModuleHandleW(NULL), NULL);
+        xctl(L"BUTTON", L"Buscar", BS_PUSHBUTTON | WS_TABSTOP, IDX_FIND);
         g_xlist = xctl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | WS_TABSTOP, IDX_LIST);
         xctl(L"BUTTON", L"Extrair selecionados...", BS_DEFPUSHBUTTON | WS_TABSTOP, IDX_EXTRACT);
         xctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, IDX_XCANCEL);
@@ -972,7 +1192,7 @@ static LRESULT CALLBACK xproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             wchar_t t[200], sz[32], lb[100];
             fmt_sizew(g_vols[i].len, sz);
             MultiByteToWideChar(CP_OEMCP, 0, g_vols[i].label, -1, lb, 100);
-            swprintf(t, 200, L"%d:  NTFS  %ls   %ls%ls%ls", i + 1, sz, lb[0] ? L"“" : L"", lb,
+            swprintf(t, 200, L"%d:  %ls  %ls   %ls%ls%ls", i + 1, strcmp(g_vols[i].fs, "NTFS") ? L"FAT32" : L"NTFS", sz, lb[0] ? L"“" : L"", lb,
                      lb[0] ? L"”" : L"");
             SendMessageW(g_xvol, CB_ADDSTRING, 0, (LPARAM)t);
         }
@@ -1003,8 +1223,10 @@ static LRESULT CALLBACK xproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == CBN_SELCHANGE) x_open_volume((int)SendMessageW(g_xvol, CB_GETCURSEL, 0, 0));
             break;
         case IDX_UP: x_up(); break;
-        case IDOK: /* Enter na lista: abre a pasta */
-            if (GetFocus() == g_xlist && !g_xrunning) {
+        case IDX_FIND: x_find(); break;
+        case IDOK: /* Enter: na busca procura; na lista abre a pasta */
+            if (GetFocus() == g_xsearch) x_find();
+            else if (GetFocus() == g_xlist && !g_xrunning) {
                 int k = ListView_GetNextItem(g_xlist, -1, LVNI_FOCUSED);
                 if (k >= 0) {
                     LVITEMW it;
@@ -1065,6 +1287,14 @@ static LRESULT CALLBACK xproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         free(p);
         return 0;
     }
+    case WM_APP_XFOUND:
+        x_set_running(0);
+        SendMessageW(g_xprog, PBM_SETPOS, 0, 0);
+        if (g_xclose_after) { EnableWindow(g_hwnd, TRUE); DestroyWindow(h); return 0; }
+        if (g_cancel && !g_found.n) { SetWindowTextW(g_xstatus, L"Busca cancelada."); return 0; }
+        g_xres = 1;
+        x_fill();
+        return 0;
     case WM_APP_XDONE: {
         wchar_t t[700], sz[32];
         g_notify = NULL;
@@ -1102,8 +1332,10 @@ static LRESULT CALLBACK xproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(h);
         return 0;
     case WM_DESTROY:
-        if (g_nt_ok) nt_close(&g_nt);
-        g_nt_ok = 0;
+        if (g_fs_ok) fs_close(&g_fs);
+        g_fs_ok = 0;
+        g_xres = 0;
+        found_free(&g_found);
         dl_free(&g_cur);
         free(g_xsel);
         g_xsel = NULL;
