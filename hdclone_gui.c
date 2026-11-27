@@ -190,6 +190,8 @@ static int peek_header(const char *path, Hdr *h)
     ReadFile(f, b, HDR_SIZE, &r, NULL);
     CloseHandle(f);
     if (r != HDR_SIZE || memcmp(b, "HDCLONE", 8) != 0 || le32(b + 508) != (u32)crc32(0, b, 508)) return -2;
+    h->version = le32(b + 8);
+    if (h->version < 1 || h->version > 2) return -3;
     h->sector = le32(b + 12);
     h->flags = le32(b + 20);
     h->size = le64(b + 24);
@@ -215,14 +217,16 @@ static void update_imginfo(void)
     r = peek_header(path, &h);
     if (r == -1) { SetWindowTextW(g_imginfo, L"Arquivo não encontrado."); return; }
     if (r == -2) { SetWindowTextW(g_imginfo, L"Este arquivo não é uma imagem do hdclone válida."); return; }
+    if (r == -3) { SetWindowTextW(g_imginfo, L"Imagem criada por uma versão mais nova do hdclone: atualize o programa."); return; }
     fmt_sizew(h.size, sz);
     {
         time_t tt = (time_t)h.created;
         struct tm *tm = localtime(&tt);
         if (tm) wcsftime(dt, 64, L"%d/%m/%Y %H:%M", tm);
     }
-    swprintf(t, 400, L"Imagem de um disco de %ls, criada em %ls (%ls).", sz, dt,
-             (h.flags & 1) ? L"somente dados usados" : L"setor a setor");
+    swprintf(t, 400, L"Imagem de um disco de %ls, criada em %ls (%ls, %ls).", sz, dt,
+             (h.flags & 1) ? L"somente dados usados" : L"setor a setor",
+             h.version >= 2 ? L"zstd" : L"zlib");
     SetWindowTextW(g_imginfo, t);
 }
 
@@ -381,9 +385,12 @@ static void start(void)
     }
 
     if (g_mode == MODE_BACKUP) {
-        static const int lv[] = {1, 6, 9};
+        /* Rapida/Normal/Maxima = zstd 1/3/9; Compativel = zlib 6 (lido por versoes antigas) */
+        static const int lv[] = {1, 3, 9, 6};
         int ci = (int)SendMessageW(g_comp, CB_GETCURSEL, 0, 0);
-        g_job.o.level = lv[ci < 0 || ci > 2 ? 1 : ci];
+        if (ci < 0 || ci > 3) ci = 1;
+        g_job.o.level = lv[ci];
+        g_job.o.compat = ci == 3;
         g_job.o.split = IsDlgButtonChecked(g_hwnd, ID_SPLIT) ? 4000ull * 1024 * 1024 : 0;
         g_job.o.raw = IsDlgButtonChecked(g_hwnd, ID_RAW) == BST_CHECKED;
         g_job.o.no_vss = IsDlgButtonChecked(g_hwnd, ID_VSS) != BST_CHECKED;
@@ -411,7 +418,9 @@ static void start(void)
         wchar_t isz[32];
         r = peek_header(g_job.path, &h);
         if (r != 0) {
-            msgbox(r == -1 ? L"Arquivo de imagem não encontrado." : L"Este arquivo não é uma imagem do hdclone válida.",
+            msgbox(r == -1 ? L"Arquivo de imagem não encontrado."
+                   : r == -3 ? L"Esta imagem foi criada por uma versão mais nova do hdclone. Atualize o programa."
+                             : L"Este arquivo não é uma imagem do hdclone válida.",
                    MB_ICONERROR);
             return;
         }
@@ -439,7 +448,9 @@ static void start(void)
         Hdr h;
         r = peek_header(g_job.path, &h);
         if (r != 0) {
-            msgbox(r == -1 ? L"Arquivo de imagem não encontrado." : L"Este arquivo não é uma imagem do hdclone válida.",
+            msgbox(r == -1 ? L"Arquivo de imagem não encontrado."
+                   : r == -3 ? L"Esta imagem foi criada por uma versão mais nova do hdclone. Atualize o programa."
+                             : L"Este arquivo não é uma imagem do hdclone válida.",
                    MB_ICONERROR);
             return;
         }
@@ -515,10 +526,12 @@ static void create_controls(void)
 
     ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 124, ID_GRP_OPT);
     ctl(L"STATIC", L"Compressão:", SS_LEFT, 24, 312, 80, 18, ID_LBL_COMP);
-    g_comp = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 104, 308, 170, 120, ID_COMP);
+    g_comp = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 104, 308, 180, 140, ID_COMP);
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Rápida (arquivo maior)");
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Normal (recomendado)");
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Máxima (mais lento)");
+    SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Compatível com versões antigas (zlib, mais lento)");
+    SendMessageW(g_comp, CB_SETDROPPEDWIDTH, S(300), 0);
     SendMessageW(g_comp, CB_SETCURSEL, 1, 0);
     ctl(L"BUTTON", L"Dividir em partes de 4 GB (para pendrive FAT32)", BS_AUTOCHECKBOX | WS_TABSTOP, 290, 310, 330, 20, ID_SPLIT);
     CheckDlgButton(g_hwnd, ID_SPLIT, BST_CHECKED);

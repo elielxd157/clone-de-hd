@@ -37,6 +37,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <zlib.h>
+#include "zstd/zstd.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -49,6 +50,8 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <semaphore.h>
 #ifdef __linux__
 #include <linux/fs.h>
 #endif
@@ -62,6 +65,7 @@
 #define CH_DEFLATE 1
 #define CH_RAW 2
 #define CH_FREE 3
+#define CH_ZSTD 4   /* comprimido com zstd (imagens versao 2) */
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -438,7 +442,19 @@ typedef struct {
     u64 total;
     u64 pos;   /* leitura: posicao na parte atual */
     u64 psize; /* leitura: tamanho da parte atual */
+    /* gravacao: buffer de 4 MB; com "direct" grava sem passar pelo cache do
+       sistema (FILE_FLAG_NO_BUFFERING / O_DIRECT), o que evita que o Windows XP
+       com pouca memoria fique lento ao gravar arquivos enormes */
+    u8 *wbuf;
+    u32 wlen;
+    int direct;
+    int padded;   /* ultima parte gravada com enchimento: precisa truncar */
+    u64 truelen;  /* tamanho real da ultima parte */
+    char err[300];
 } Img;
+
+#define WBUF (4u * 1024 * 1024)
+#define WALIGN 4096u
 
 static void part_name(const char *base, int part, char *out)
 {
@@ -452,7 +468,12 @@ static int img_open_part(Img *m, int write)
     part_name(m->base, m->part, nm);
 #ifdef _WIN32
     m->h = CreateFileA(nm, write ? GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ, NULL,
-                       write ? CREATE_ALWAYS : OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                       write ? CREATE_ALWAYS : OPEN_EXISTING,
+                       (write && m->direct) ? FILE_FLAG_NO_BUFFERING : FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (m->h == INVALID_HANDLE_VALUE && write && m->direct) { /* sem suporte: grava pelo cache */
+        m->direct = 0;
+        m->h = CreateFileA(nm, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    }
     if (m->h == INVALID_HANDLE_VALUE) return -1;
     res_add(RES_HANDLE, m->h);
     m->pos = 0;
@@ -463,7 +484,14 @@ static int img_open_part(Img *m, int write)
     return 0;
 #else
     struct stat st;
-    m->fd = open(nm, write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY, 0644);
+#ifdef O_DIRECT
+    if (write && m->direct) {
+        m->fd = open(nm, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+        if (m->fd < 0) m->direct = 0; /* ex.: tmpfs nao aceita O_DIRECT */
+    } else
+#endif
+        m->fd = -1;
+    if (m->fd < 0) m->fd = open(nm, write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY, 0644);
     if (m->fd < 0) return -1;
     res_add(RES_HANDLE, (void *)(intptr_t)(m->fd + 1));
     m->pos = 0;
@@ -483,12 +511,31 @@ static void img_close_part(Img *m)
 #endif
 }
 
+/* gravacao direta possivel? (setor do volume de destino divide 4096) */
+static int direct_ok(const char *path)
+{
+#ifdef _WIN32
+    char full[MAX_PATH], root[MAX_PATH];
+    DWORD spc, bps, fc, tc;
+    if (!GetFullPathNameA(path, MAX_PATH, full, NULL) || !GetVolumePathNameA(full, root, MAX_PATH)) return 0;
+    if (!GetDiskFreeSpaceA(root, &spc, &bps, &fc, &tc) || !bps || WALIGN % bps) return 0;
+    return 1;
+#else
+    (void)path;
+    return getenv("HDCLONE_NO_DIRECT") ? 0 : 1;
+#endif
+}
+
 static int img_open(Img *m, const char *path, int write, u64 limit)
 {
     memset(m, 0, sizeof(*m));
     strncpy(m->base, path, sizeof(m->base) - 1);
     m->part = 1;
     m->limit = limit;
+    if (write) {
+        m->direct = direct_ok(path);
+        m->wbuf = xalloc(WBUF + WALIGN);
+    }
     return img_open_part(m, write);
 }
 
@@ -520,22 +567,87 @@ static int raw_read(Img *m, void *p, u32 n)
 #endif
 }
 
-static void img_write(Img *m, const void *buf, u64 n)
+/* esvazia o buffer de gravacao nas partes (final = ultimo pedaco, pode nao ser alinhado) */
+static int img_flush(Img *m, int final)
 {
-    const u8 *p = buf;
-    while (n) {
-        u64 take = n;
+    u32 off = 0;
+    while (off < m->wlen) {
+        u32 piece = m->wlen - off, wr;
         if (m->limit && m->cur >= m->limit) {
             img_close_part(m);
             m->part++;
             m->cur = 0;
-            if (img_open_part(m, 1) != 0) die("nao foi possivel criar a proxima parte da imagem");
+            if (img_open_part(m, 1) != 0) {
+                snprintf(m->err, sizeof(m->err), "nao foi possivel criar a proxima parte da imagem");
+                return -1;
+            }
         }
-        if (m->limit && take > m->limit - m->cur) take = m->limit - m->cur;
-        if (raw_write(m, p, (u32)take) != 0)
-            die("falha ao gravar imagem (disco de destino cheio?)");
-        p += take; n -= take; m->cur += take; m->total += take;
+        if (m->limit && piece > m->limit - m->cur) piece = (u32)(m->limit - m->cur);
+        wr = piece;
+        if (m->direct && (wr % WALIGN)) { /* so no fim: completa com zeros e depois trunca */
+            u32 pad = WALIGN - wr % WALIGN;
+            if (!final) { snprintf(m->err, sizeof(m->err), "erro interno de alinhamento"); return -1; }
+            memset(m->wbuf + off + wr, 0, pad);
+            wr += pad;
+            m->padded = 1;
+            m->truelen = m->cur + piece;
+        }
+        if (raw_write(m, m->wbuf + off, wr) != 0) {
+            snprintf(m->err, sizeof(m->err), "falha ao gravar imagem (disco de destino cheio?)");
+            return -1;
+        }
+        m->cur += piece;
+        off += piece;
     }
+    m->wlen = 0;
+    return 0;
+}
+
+/* acrescenta bytes a imagem; -1 em erro (mensagem em m->err). Seguro em thread. */
+static int img_write_nd(Img *m, const void *buf, u64 n)
+{
+    const u8 *p = buf;
+    while (n) {
+        u32 take = WBUF - m->wlen;
+        if (take > n) take = (u32)n;
+        memcpy(m->wbuf + m->wlen, p, take);
+        m->wlen += take;
+        p += take; n -= take; m->total += take;
+        if (m->wlen == WBUF && img_flush(m, 0) != 0) return -1;
+    }
+    return 0;
+}
+
+static void img_write(Img *m, const void *buf, u64 n)
+{
+    if (img_write_nd(m, buf, n) != 0) die(m->err);
+}
+
+/* termina a gravacao: grava o resto, fecha e acerta o tamanho da ultima parte */
+static void img_finish(Img *m)
+{
+    char nm[620];
+    if (img_flush(m, 1) != 0) die(m->err);
+    img_close_part(m);
+    xfree(m->wbuf);
+    m->wbuf = NULL;
+    if (!m->padded) return;
+    part_name(m->base, m->part, nm);
+#ifdef _WIN32
+    {
+        HANDLE h = CreateFileA(nm, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        LARGE_INTEGER li;
+        int ok = 0;
+        li.QuadPart = (LONGLONG)m->truelen;
+        if (h != INVALID_HANDLE_VALUE) {
+            ok = SetFilePointerEx(h, li, NULL, FILE_BEGIN) && SetEndOfFile(h);
+            CloseHandle(h);
+        }
+        if (!ok) die("falha ao finalizar o arquivo de imagem");
+    }
+#else
+    if (truncate(nm, (off_t)m->truelen) != 0) die("falha ao finalizar o arquivo de imagem");
+#endif
 }
 
 /* retorna 0 se leu tudo, -1 se acabou o arquivo/partes */
@@ -2016,8 +2128,255 @@ static int confirm(const char *msg)
 /* BACKUP                                                              */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* threads (so recursos que existem no Windows XP) e pipeline          */
+/* ------------------------------------------------------------------ */
+/*
+ * Ler, comprimir e gravar acontecem ao mesmo tempo:
+ *   produtor (le o disco/imagem) -> N trabalhadores (comprimem) -> consumidor (grava em ordem)
+ * Mesmo com 1 nucleo isso ajuda: enquanto o processador comprime, o disco ja le o
+ * proximo bloco. As threads nunca chamam die(): registram o erro e param; quem
+ * chama pipe_run() encerra tudo em ordem e so entao reporta.
+ */
+
+#ifdef _WIN32
+typedef HANDLE xsem_t;
+typedef CRITICAL_SECTION xmtx_t;
+typedef HANDLE xthr_t;
+static void xsem_init(xsem_t *x, int v) { *x = CreateSemaphoreA(NULL, v, 0x7FFFFFFF, NULL); }
+static void xsem_wait(xsem_t *x) { WaitForSingleObject(*x, INFINITE); }
+static void xsem_post(xsem_t *x, int n) { ReleaseSemaphore(*x, n, NULL); }
+static void xsem_free(xsem_t *x) { CloseHandle(*x); }
+static void xmtx_init(xmtx_t *x) { InitializeCriticalSection(x); }
+static void xmtx_lock(xmtx_t *x) { EnterCriticalSection(x); }
+static void xmtx_unlock(xmtx_t *x) { LeaveCriticalSection(x); }
+static void xmtx_free(xmtx_t *x) { DeleteCriticalSection(x); }
+static void xsleep(int ms) { Sleep(ms); }
+#else
+typedef sem_t xsem_t;
+typedef pthread_mutex_t xmtx_t;
+typedef pthread_t xthr_t;
+static void xsem_init(xsem_t *x, int v) { sem_init(x, 0, (unsigned)v); }
+static void xsem_wait(xsem_t *x) { while (sem_wait(x) != 0 && errno == EINTR) ; }
+static void xsem_post(xsem_t *x, int n) { while (n-- > 0) sem_post(x); }
+static void xsem_free(xsem_t *x) { sem_destroy(x); }
+static void xmtx_init(xmtx_t *x) { pthread_mutex_init(x, NULL); }
+static void xmtx_lock(xmtx_t *x) { pthread_mutex_lock(x); }
+static void xmtx_unlock(xmtx_t *x) { pthread_mutex_unlock(x); }
+static void xmtx_free(xmtx_t *x) { pthread_mutex_destroy(x); }
+static void xsleep(int ms) { usleep((useconds_t)ms * 1000); }
+#endif
+
 typedef struct {
-    int level;
+    void (*fn)(void *);
+    void *arg;
+} ThrArg;
+
+#ifdef _WIN32
+static DWORD WINAPI thr_tramp(LPVOID a) { ((ThrArg *)a)->fn(((ThrArg *)a)->arg); return 0; }
+static int xthr_start(xthr_t *t, ThrArg *a)
+{
+    DWORD id;
+    *t = CreateThread(NULL, 0, thr_tramp, a, 0, &id);
+    return *t ? 0 : -1;
+}
+static void xthr_join(xthr_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
+#else
+static void *thr_tramp(void *a) { ((ThrArg *)a)->fn(((ThrArg *)a)->arg); return NULL; }
+static int xthr_start(xthr_t *t, ThrArg *a) { return pthread_create(t, NULL, thr_tramp, a); }
+static void xthr_join(xthr_t *t) { pthread_join(*t, NULL); }
+#endif
+
+static int ncores(void)
+{
+    int n;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    n = (int)si.dwNumberOfProcessors;
+#else
+    n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (getenv("HDCLONE_THREADS")) n = atoi(getenv("HDCLONE_THREADS"));
+    return n < 1 ? 1 : n > 8 ? 8 : n;
+}
+
+#define CBUF_SIZE (CHUNK_SIZE + CHUNK_SIZE / 8 + 4096) /* >= compressBound e ZSTD_compressBound de 1 MB */
+#define T_PENDING 0xFF  /* bloco lido, aguardando compressao */
+
+typedef struct {
+    u64 idx;
+    u32 len, stored, crc;
+    u8 type;
+    u8 *buf, *cbuf;
+    const u8 *out; /* restauracao: dados a gravar (NULL = pular) */
+} Slot;
+
+typedef struct Pipe Pipe;
+struct Pipe {
+    int K, N;
+    Slot *s;
+    u64 total;          /* numero de blocos */
+    int (*produce)(Pipe *, Slot *);
+    int (*work)(Pipe *, Slot *, int w);
+    int (*consume)(Pipe *, Slot *);
+    void *ctx;
+    volatile int abort, cons_done;
+    char err[600];
+    xmtx_t mtx;
+    u64 next_work;
+    volatile u64 done_bytes, total_bytes;
+    xsem_t sfree, swork, *sdone;
+};
+
+static void pipe_wake(Pipe *p)
+{
+    int k;
+    xsem_post(&p->sfree, p->K);
+    xsem_post(&p->swork, p->N + 1);
+    for (k = 0; k < p->K; k++) xsem_post(&p->sdone[k], 1);
+}
+
+/* registra o primeiro erro e faz todas as threads pararem */
+static void pipe_fail(Pipe *p, const char *msg)
+{
+    int first = 0;
+    xmtx_lock(&p->mtx);
+    if (!p->abort) {
+        snprintf(p->err, sizeof(p->err), "%s", msg);
+        p->abort = 1;
+        first = 1;
+    }
+    xmtx_unlock(&p->mtx);
+    if (first) pipe_wake(p);
+}
+
+static void pipe_producer(void *a)
+{
+    Pipe *p = a;
+    u64 i;
+    for (i = 0; i < p->total; i++) {
+        Slot *sl;
+        xsem_wait(&p->sfree);
+        if (p->abort) return;
+        sl = &p->s[i % p->K];
+        sl->idx = i;
+        if (p->produce(p, sl) != 0) return;
+        xsem_post(&p->swork, 1);
+    }
+}
+
+typedef struct {
+    Pipe *p;
+    int w;
+    ThrArg ta;
+} WArg;
+
+static void pipe_worker(void *a)
+{
+    WArg *wa = a;
+    Pipe *p = wa->p;
+    for (;;) {
+        u64 i;
+        xsem_wait(&p->swork);
+        if (p->abort) return;
+        xmtx_lock(&p->mtx);
+        i = p->next_work++;
+        xmtx_unlock(&p->mtx);
+        if (i >= p->total) return;
+        if (p->work(p, &p->s[i % p->K], wa->w) != 0) return;
+        xsem_post(&p->sdone[i % p->K], 1);
+    }
+}
+
+static void pipe_consumer(void *a)
+{
+    Pipe *p = a;
+    u64 i;
+    for (i = 0; i < p->total; i++) {
+        xsem_wait(&p->sdone[i % p->K]);
+        if (p->abort) break;
+        if (p->consume(p, &p->s[i % p->K]) != 0) break;
+        xsem_post(&p->sfree, 1);
+    }
+    p->cons_done = 1;
+}
+
+/* aloca os blocos de trabalho (K = 2N+2) */
+static void pipe_init(Pipe *p, u64 total, u64 total_bytes)
+{
+    int k;
+    memset(p, 0, sizeof(*p));
+    p->N = ncores();
+    p->K = 2 * p->N + 2;
+    p->total = total;
+    p->total_bytes = total_bytes;
+    p->s = xalloc(sizeof(Slot) * p->K);
+    for (k = 0; k < p->K; k++) {
+        p->s[k].buf = xalloc(CHUNK_SIZE);
+        p->s[k].cbuf = xalloc(CBUF_SIZE);
+    }
+}
+
+static void pipe_free(Pipe *p)
+{
+    int k;
+    for (k = 0; k < p->K; k++) {
+        xfree(p->s[k].buf);
+        xfree(p->s[k].cbuf);
+    }
+    xfree(p->s);
+}
+
+/* roda o pipeline; mostra progresso e atende ao cancelamento. 0 = ok */
+static int pipe_run(Pipe *p)
+{
+    xthr_t tp, tc, tw[8];
+    ThrArg ap, ac;
+    WArg wa[8];
+    int k, nw = 0;
+    xmtx_init(&p->mtx);
+    xsem_init(&p->sfree, p->K);
+    xsem_init(&p->swork, 0);
+    p->sdone = malloc(sizeof(xsem_t) * p->K);
+    for (k = 0; k < p->K; k++) xsem_init(&p->sdone[k], 0);
+    ap.fn = pipe_producer; ap.arg = p;
+    ac.fn = pipe_consumer; ac.arg = p;
+    g_t0 = g_tlast = now_ms();
+    if (xthr_start(&tc, &ac) != 0) die("nao foi possivel criar threads");
+    for (k = 0; k < p->N; k++) {
+        wa[k].p = p;
+        wa[k].w = k;
+        wa[k].ta.fn = pipe_worker;
+        wa[k].ta.arg = &wa[k];
+        if (xthr_start(&tw[k], &wa[k].ta) == 0) nw++;
+        else break;
+    }
+    if (!nw || xthr_start(&tp, &ap) != 0) {
+        pipe_fail(p, "nao foi possivel criar threads");
+        p->cons_done = 1;
+    }
+    while (!p->cons_done) {
+        xsleep(100);
+        if (g_cancel) pipe_fail(p, "Operacao cancelada pelo usuario.");
+        progress(p->done_bytes, p->total_bytes, 0);
+    }
+    if (!p->abort) xsem_post(&p->swork, p->N + 1); /* libera os trabalhadores */
+    if (nw) xthr_join(&tp);
+    for (k = 0; k < nw; k++) xthr_join(&tw[k]);
+    xthr_join(&tc);
+    if (!p->abort) progress(p->total_bytes, p->total_bytes, 1);
+    xsem_free(&p->sfree);
+    xsem_free(&p->swork);
+    for (k = 0; k < p->K; k++) xsem_free(&p->sdone[k]);
+    free(p->sdone);
+    xmtx_free(&p->mtx);
+    return p->abort ? -1 : 0;
+}
+
+typedef struct {
+    int level;    /* zstd: 1..19 (padrao 3); --compat: zlib 1..9 (padrao 6) */
+    int compat;   /* formato antigo (zlib), legivel por versoes anteriores */
     u64 split;
     int raw;
     int yes;
@@ -2030,14 +2389,122 @@ typedef struct {
 static int g_vss_used; /* ultimo backup usou VSS */
 static int g_shrunk;   /* ultima restauracao reduziu uma particao */
 
+/* ---- backup em pipeline ---- */
+
+typedef struct {
+    Dev *d;
+    Img *m;
+    Opts *o;
+    u64 bad, used, nfree;
+    ZSTD_CCtx *zc[8];
+    u8 *probe[8];
+} BkCtx;
+
+static int bk_produce(Pipe *p, Slot *sl)
+{
+    BkCtx *c = p->ctx;
+    Dev *d = c->d;
+    u64 off = sl->idx * CHUNK_SIZE, q, pp;
+    u32 len = (u32)((d->size - off) < CHUNK_SIZE ? (d->size - off) : CHUNK_SIZE);
+    int any_free = 0, all_free = 1, f, k;
+    sl->len = len;
+    sl->stored = sl->crc = 0;
+    if (!c->o->raw && g_nareas) {
+        for (pp = off; pp < off + len; pp = q) {
+            q = seg_next(pp, off + len, &f);
+            if (f) any_free = 1; else all_free = 0;
+        }
+    } else {
+        all_free = 0;
+    }
+    if (all_free) {
+        sl->type = CH_FREE;
+        c->nfree++;
+        return 0;
+    }
+    if (dev_pread(d, sl->buf, len, off) != 0) { /* setor defeituoso: tenta setor por setor */
+        u32 j;
+        for (j = 0; j < len; j += d->sector)
+            if (dev_pread(d, sl->buf + j, d->sector, off + j) != 0) {
+                memset(sl->buf + j, 0, d->sector);
+                c->bad++;
+            }
+    }
+    for (k = 0; k < g_nzr; k++) { /* inicio de hiberfil/pagefile: gravado como zero */
+        u64 zs = g_zr[k].off, ze = g_zr[k].off + g_zr[k].len;
+        if (ze > off && zs < off + len) {
+            if (zs < off) zs = off;
+            if (ze > off + len) ze = off + len;
+            memset(sl->buf + (zs - off), 0, (size_t)(ze - zs));
+        }
+    }
+    if (any_free) /* zera os clusters livres para comprimir melhor */
+        for (pp = off; pp < off + len; pp = q) {
+            q = seg_next(pp, off + len, &f);
+            if (f) memset(sl->buf + (pp - off), 0, (size_t)(q - pp));
+        }
+    sl->type = all_zero(sl->buf, len) ? CH_ZERO : T_PENDING;
+    return 0;
+}
+
+static int bk_work(Pipe *p, Slot *sl, int w)
+{
+    BkCtx *c = p->ctx;
+    if (sl->type != T_PENDING) return 0;
+    sl->crc = (u32)crc32(0, sl->buf, sl->len);
+    if (!c->o->compat) {
+        size_t r = ZSTD_compressCCtx(c->zc[w], sl->cbuf, CBUF_SIZE, sl->buf, sl->len, c->o->level);
+        if (!ZSTD_isError(r) && r < sl->len) { sl->type = CH_ZSTD; sl->stored = (u32)r; }
+        else { sl->type = CH_RAW; sl->stored = sl->len; }
+        return 0;
+    }
+    /* modo compativel (zlib): testa 64 KB primeiro; se nao comprime, nem tenta o bloco
+       inteiro (o zlib e lento em dados ja comprimidos: fotos, videos, zip) */
+    if (sl->len >= 65536) {
+        uLongf pl = compressBound(65536);
+        if (compress2(c->probe[w], &pl, sl->buf, 65536, 1) == Z_OK && pl > 65536u * 97 / 100) {
+            sl->type = CH_RAW;
+            sl->stored = sl->len;
+            return 0;
+        }
+    }
+    {
+        uLongf cl = CBUF_SIZE;
+        if (compress2(sl->cbuf, &cl, sl->buf, sl->len, c->o->level) == Z_OK && cl < sl->len) {
+            sl->type = CH_DEFLATE;
+            sl->stored = (u32)cl;
+        } else {
+            sl->type = CH_RAW;
+            sl->stored = sl->len;
+        }
+    }
+    return 0;
+}
+
+static int bk_consume(Pipe *p, Slot *sl)
+{
+    BkCtx *c = p->ctx;
+    u8 ch[9];
+    ch[0] = sl->type;
+    put32(ch + 1, sl->stored);
+    put32(ch + 5, sl->crc);
+    if (img_write_nd(c->m, ch, 9) != 0 ||
+        (sl->type == CH_DEFLATE || sl->type == CH_ZSTD ? img_write_nd(c->m, sl->cbuf, sl->stored)
+         : sl->type == CH_RAW ? img_write_nd(c->m, sl->buf, sl->stored) : 0) != 0) {
+        pipe_fail(p, c->m->err);
+        return -1;
+    }
+    if (sl->type != CH_FREE && sl->type != CH_ZERO) c->used += sl->len;
+    p->done_bytes += sl->len;
+    return 0;
+}
+
 static void cmd_backup(const char *src, const char *dst, Opts *o)
 {
     Dev d;
     Img m;
-    u8 hdr[HDR_SIZE], ftr[FTR_SIZE], ch[9];
-    u8 *buf, *cbuf;
-    uLong cbound = compressBound(CHUNK_SIZE);
-    u64 nchunks, i, used = 0, bad = 0, nfree = 0;
+    u8 hdr[HDR_SIZE], ftr[FTR_SIZE];
+    u64 nchunks, used = 0, bad = 0, nfree = 0;
     char s1[32], s2[32];
 
     if (dev_open(&d, src, 0) != 0) die("nao foi possivel abrir o disco de origem (execute como Administrador)");
@@ -2086,7 +2553,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     nchunks = (d.size + CHUNK_SIZE - 1) / CHUNK_SIZE;
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, "HDCLONE", 8);
-    put32(hdr + 8, 1);
+    put32(hdr + 8, o->compat ? 1 : 2); /* 2 = pode conter blocos zstd */
     put32(hdr + 12, d.sector);
     put32(hdr + 16, CHUNK_SIZE);
     put32(hdr + 20, (o->raw ? 0 : 1) | (g_vss_used ? 2 : 0));
@@ -2098,80 +2565,35 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     put32(hdr + 508, (u32)crc32(0, hdr, 508));
     img_write(&m, hdr, HDR_SIZE);
 
-    buf = xalloc(CHUNK_SIZE);
-    cbuf = xalloc(cbound);
-    printf("\nCopiando...\n");
-    g_t0 = g_tlast = now_ms();
-
-    for (i = 0; i < nchunks; i++) {
-        u64 off = i * CHUNK_SIZE;
-        u32 len = (u32)((d.size - off) < CHUNK_SIZE ? (d.size - off) : CHUNK_SIZE);
-        int any_free = 0, all_free = 1, f, k;
-        u64 p, q;
-        u8 type;
-        u32 stored = 0, crc = 0;
-
-        if (g_cancel) die("Operacao cancelada pelo usuario.");
-
-        if (!o->raw && g_nareas) {
-            for (p = off; p < off + len; p = q) {
-                q = seg_next(p, off + len, &f);
-                if (f) any_free = 1; else all_free = 0;
-            }
-        } else {
-            all_free = 0;
+    {
+        Pipe pp;
+        BkCtx bc;
+        int k, rc;
+        memset(&bc, 0, sizeof(bc));
+        bc.d = &d;
+        bc.m = &m;
+        bc.o = o;
+        pipe_init(&pp, nchunks, d.size);
+        pp.produce = bk_produce;
+        pp.work = bk_work;
+        pp.consume = bk_consume;
+        pp.ctx = &bc;
+        for (k = 0; k < pp.N; k++) {
+            if (!o->compat) bc.zc[k] = ZSTD_createCCtx();
+            else bc.probe[k] = xalloc(compressBound(65536));
         }
-
-        if (all_free) {
-            type = CH_FREE;
-            nfree++;
-        } else {
-            if (dev_pread(&d, buf, len, off) != 0) {
-                /* setor defeituoso: tenta setor por setor */
-                u32 k;
-                for (k = 0; k < len; k += d.sector) {
-                    if (dev_pread(&d, buf + k, d.sector, off + k) != 0) {
-                        memset(buf + k, 0, d.sector);
-                        bad++;
-                    }
-                }
-            }
-            for (k = 0; k < g_nzr; k++) { /* inicio de hiberfil/pagefile: gravado como zero */
-                u64 zs = g_zr[k].off, ze = g_zr[k].off + g_zr[k].len;
-                if (ze > off && zs < off + len) {
-                    if (zs < off) zs = off;
-                    if (ze > off + len) ze = off + len;
-                    memset(buf + (zs - off), 0, (size_t)(ze - zs));
-                }
-            }
-            if (any_free) { /* zera os clusters livres para comprimir melhor */
-                for (p = off; p < off + len; p = q) {
-                    q = seg_next(p, off + len, &f);
-                    if (f) memset(buf + (p - off), 0, (size_t)(q - p));
-                }
-            }
-            if (all_zero(buf, len)) {
-                type = CH_ZERO;
-            } else {
-                uLongf cl = cbound;
-                used += len;
-                crc = (u32)crc32(0, buf, len);
-                if (compress2(cbuf, &cl, buf, len, o->level) == Z_OK && cl < len) {
-                    type = CH_DEFLATE;
-                    stored = (u32)cl;
-                } else {
-                    type = CH_RAW;
-                    stored = len;
-                }
-            }
+        printf("\nCopiando (%s nivel %d, %d thread%s de compressao%s)...\n", o->compat ? "zlib" : "zstd", o->level,
+               pp.N, pp.N > 1 ? "s" : "", m.direct ? ", gravacao direta" : "");
+        rc = pipe_run(&pp);
+        for (k = 0; k < pp.N; k++) {
+            ZSTD_freeCCtx(bc.zc[k]);
+            xfree(bc.probe[k]);
         }
-        ch[0] = type;
-        put32(ch + 1, stored);
-        put32(ch + 5, crc);
-        img_write(&m, ch, 9);
-        if (type == CH_DEFLATE) img_write(&m, cbuf, stored);
-        else if (type == CH_RAW) img_write(&m, buf, stored);
-        progress(off + len, d.size, i + 1 == nchunks);
+        pipe_free(&pp);
+        if (rc != 0) die(pp.err);
+        used = bc.used;
+        bad = bc.bad;
+        nfree = bc.nfree;
     }
 
     memset(ftr, 0, sizeof(ftr));
@@ -2182,7 +2604,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     put64(ftr + 32, bad);
     put32(ftr + 44, (u32)crc32(0, ftr, 44));
     img_write(&m, ftr, FTR_SIZE);
-    img_close_part(&m);
+    img_finish(&m);
     unlock_all();
     vss_end(1);
     dev_close(&d);
@@ -2195,8 +2617,6 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
     if (nfree) printf("  Blocos de espaco livre ignorados: %llu MB\n", (unsigned long long)nfree);
     if (bad) printf("  ATENCAO: %llu setores ilegiveis foram preenchidos com zeros!\n", (unsigned long long)bad);
     if (g_vss_used) printf("  Copia consistente feita via VSS (snapshots temporarios ja removidos).\n");
-    xfree(buf);
-    xfree(cbuf);
     reset_areas();
 }
 
@@ -2205,7 +2625,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    u32 sector, chunk, flags;
+    u32 version, sector, chunk, flags;
     u64 size, nchunks, created;
     char src[129], tool[33];
 } Hdr;
@@ -2216,7 +2636,9 @@ static void read_header(Img *m, Hdr *h)
     if (img_read(m, b, HDR_SIZE) != 0) die("arquivo de imagem vazio ou ilegivel");
     if (memcmp(b, "HDCLONE", 8) != 0) die("este arquivo nao e uma imagem do hdclone");
     if (le32(b + 508) != (u32)crc32(0, b, 508)) die("cabecalho da imagem corrompido");
-    if (le32(b + 8) != 1) die("versao de imagem nao suportada");
+    h->version = le32(b + 8);
+    if (h->version < 1 || h->version > 2)
+        die("esta imagem foi criada por uma versao mais nova do hdclone; atualize o programa");
     h->sector = le32(b + 12);
     h->chunk = le32(b + 16);
     h->flags = le32(b + 20);
@@ -2241,6 +2663,7 @@ static void print_header(Hdr *h)
     printf("  Criada em      : %s  com %s\n", t, h->tool);
     printf("  Modo           : %s%s\n", (h->flags & 1) ? "inteligente (somente dados usados)" : "setor a setor",
            (h->flags & 2) ? ", copia consistente via VSS" : "");
+    printf("  Compressao     : %s\n", h->version >= 2 ? "zstd" : "zlib (formato compativel com versoes antigas)");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2340,8 +2763,8 @@ static void imgsrc_open(const char *path)
         c->type = ch[0];
         c->stored = le32(ch + 1);
         c->crc = le32(ch + 5);
-        if (c->type > CH_FREE || c->stored > compressBound(CHUNK_SIZE)) die("imagem corrompida");
-        if (c->type == CH_DEFLATE || c->type == CH_RAW) {
+        if (c->type > CH_ZSTD || c->stored > CBUF_SIZE) die("imagem corrompida");
+        if (c->type == CH_DEFLATE || c->type == CH_RAW || c->type == CH_ZSTD) {
             c->part = s->m.part;
             c->pos = s->m.pos;
             if (img_skip(&s->m, c->stored) != 0) die("imagem incompleta (falta alguma parte?)");
@@ -2353,7 +2776,7 @@ static void imgsrc_open(const char *path)
         s->cache[i] = xalloc(CHUNK_SIZE);
         s->ci[i] = -1;
     }
-    s->cbuf = xalloc(compressBound(CHUNK_SIZE));
+    s->cbuf = xalloc(CBUF_SIZE);
 }
 
 static void imgsrc_close(void)
@@ -2387,6 +2810,9 @@ static u8 *imgsrc_chunk(ImgSrc *s, u64 i)
         if (img_seek(&s->m, c->part, c->pos) != 0) return NULL;
         if (c->type == CH_RAW) {
             if (img_read(&s->m, dst, len) != 0) return NULL;
+        } else if (c->type == CH_ZSTD) {
+            if (img_read(&s->m, s->cbuf, c->stored) != 0) return NULL;
+            if (ZSTD_decompress(dst, CHUNK_SIZE, s->cbuf, c->stored) != len) return NULL;
         } else {
             uLongf ul = CHUNK_SIZE;
             if (img_read(&s->m, s->cbuf, c->stored) != 0) return NULL;
@@ -3297,72 +3723,123 @@ static void cmd_extract(const char *img, const char *vol, const char *path, cons
     if (g_xs.errors) die("alguns arquivos nao puderam ser extraidos (veja acima)");
 }
 
-/* processa a imagem; se d != NULL grava no disco */
+/* ---- restauracao / verificacao em pipeline ---- */
+
+typedef struct {
+    Img *m;
+    Dev *d;
+    Opts *o;
+    Hdr *h;
+    u64 limit;
+    u8 *zeros;
+    ZSTD_DCtx *zd[8];
+} RsCtx;
+
+static int rs_produce(Pipe *p, Slot *sl)
+{
+    RsCtx *c = p->ctx;
+    u8 ch[9];
+    char msg[200];
+    u64 off = sl->idx * CHUNK_SIZE;
+    sl->len = (u32)((c->h->size - off) < CHUNK_SIZE ? (c->h->size - off) : CHUNK_SIZE);
+    if (img_read(c->m, ch, 9) != 0) {
+        snprintf(msg, sizeof(msg), "imagem incompleta: termina no bloco %llu de %llu (falta alguma parte?)",
+                 (unsigned long long)sl->idx, (unsigned long long)c->h->nchunks);
+        pipe_fail(p, msg);
+        return -1;
+    }
+    sl->type = ch[0];
+    sl->stored = le32(ch + 1);
+    sl->crc = le32(ch + 5);
+    if (sl->type > CH_ZSTD || (sl->type == CH_RAW && sl->stored != sl->len) || sl->stored > CBUF_SIZE) {
+        snprintf(msg, sizeof(msg), "bloco %llu invalido (imagem corrompida)", (unsigned long long)sl->idx);
+        pipe_fail(p, msg);
+        return -1;
+    }
+    if ((sl->type == CH_DEFLATE || sl->type == CH_RAW || sl->type == CH_ZSTD) &&
+        img_read(c->m, sl->cbuf, sl->stored) != 0) {
+        pipe_fail(p, "imagem corrompida/incompleta (falta alguma parte?)");
+        return -1;
+    }
+    return 0;
+}
+
+static int rs_work(Pipe *p, Slot *sl, int w)
+{
+    RsCtx *c = p->ctx;
+    char msg[200];
+    switch (sl->type) {
+    case CH_ZERO: sl->out = c->zeros; return 0;
+    case CH_FREE: sl->out = c->o->zero_free ? c->zeros : NULL; return 0;
+    case CH_RAW: sl->out = sl->cbuf; break;
+    case CH_ZSTD:
+        if (ZSTD_decompressDCtx(c->zd[w], sl->buf, CHUNK_SIZE, sl->cbuf, sl->stored) != sl->len) goto bad;
+        sl->out = sl->buf;
+        break;
+    default: {
+        uLongf ul = CHUNK_SIZE;
+        if (uncompress(sl->buf, &ul, sl->cbuf, sl->stored) != Z_OK || ul != sl->len) goto bad;
+        sl->out = sl->buf;
+    }
+    }
+    if ((u32)crc32(0, sl->out, sl->len) == sl->crc) return 0;
+    snprintf(msg, sizeof(msg), "CRC invalido no bloco %llu (imagem corrompida)", (unsigned long long)sl->idx);
+    pipe_fail(p, msg);
+    return -1;
+bad:
+    snprintf(msg, sizeof(msg), "dados corrompidos no bloco %llu", (unsigned long long)sl->idx);
+    pipe_fail(p, msg);
+    return -1;
+}
+
+static int rs_consume(Pipe *p, Slot *sl)
+{
+    RsCtx *c = p->ctx;
+    u64 off = sl->idx * CHUNK_SIZE;
+    if (c->d && sl->out && off < c->limit &&
+        dev_pwrite(c->d, sl->out, off + sl->len > c->limit ? (u32)(c->limit - off) : sl->len, off) != 0) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "falha de escrita no disco de destino na posicao %llu MB",
+                 (unsigned long long)(off >> 20));
+        pipe_fail(p, msg);
+        return -1;
+    }
+    p->done_bytes += sl->len;
+    return 0;
+}
+
+/* processa a imagem; se d != NULL grava no disco (ate "limit" bytes) */
 static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m, u64 limit)
 {
-    u8 ch[9], ftr[FTR_SIZE];
-    u8 *buf = xalloc(CHUNK_SIZE), *cbuf = xalloc(compressBound(CHUNK_SIZE)), *zeros = xalloc(CHUNK_SIZE);
-    u64 i;
+    u8 ftr[FTR_SIZE];
+    Pipe pp;
+    RsCtx rc;
+    int k, r;
     (void)path;
-    g_t0 = g_tlast = now_ms();
-    for (i = 0; i < h->nchunks; i++) {
-        u64 off = i * CHUNK_SIZE;
-        u32 len = (u32)((h->size - off) < CHUNK_SIZE ? (h->size - off) : CHUNK_SIZE);
-        u32 stored, crc;
-        const u8 *data = NULL;
-        char msg[128];
-        if (g_cancel) die("Operacao cancelada pelo usuario.");
-        if (img_read(m, ch, 9) != 0) {
-            sprintf(msg, "imagem incompleta: termina no bloco %llu de %llu (falta alguma parte?)",
-                    (unsigned long long)i, (unsigned long long)h->nchunks);
-            die(msg);
-        }
-        stored = le32(ch + 1);
-        crc = le32(ch + 5);
-        switch (ch[0]) {
-        case CH_ZERO:
-            data = zeros;
-            break;
-        case CH_FREE:
-            data = o->zero_free ? zeros : NULL;
-            break;
-        case CH_DEFLATE: {
-            uLongf ul = CHUNK_SIZE;
-            if (stored > compressBound(CHUNK_SIZE) || img_read(m, cbuf, stored) != 0) die("imagem corrompida/incompleta");
-            if (uncompress(buf, &ul, cbuf, stored) != Z_OK || ul != len) {
-                sprintf(msg, "dados corrompidos no bloco %llu", (unsigned long long)i);
-                die(msg);
-            }
-            data = buf;
-            break;
-        }
-        case CH_RAW:
-            if (stored != len || img_read(m, buf, stored) != 0) die("imagem corrompida/incompleta");
-            data = buf;
-            break;
-        default:
-            sprintf(msg, "tipo de bloco invalido no bloco %llu (imagem corrompida)", (unsigned long long)i);
-            die(msg);
-        }
-        if ((ch[0] == CH_DEFLATE || ch[0] == CH_RAW) && (u32)crc32(0, data, len) != crc) {
-            sprintf(msg, "CRC invalido no bloco %llu (imagem corrompida)", (unsigned long long)i);
-            die(msg);
-        }
-        if (d && data && off < limit && dev_pwrite(d, data, off + len > limit ? (u32)(limit - off) : len, off) != 0) {
-            sprintf(msg, "falha de escrita no disco de destino na posicao %llu MB", (unsigned long long)(off >> 20));
-            die(msg);
-        }
-        progress(off + len, h->size, i + 1 == h->nchunks);
-    }
+    memset(&rc, 0, sizeof(rc));
+    rc.m = m;
+    rc.d = d;
+    rc.o = o;
+    rc.h = h;
+    rc.limit = limit;
+    rc.zeros = xalloc(CHUNK_SIZE);
+    pipe_init(&pp, h->nchunks, h->size);
+    pp.produce = rs_produce;
+    pp.work = rs_work;
+    pp.consume = rs_consume;
+    pp.ctx = &rc;
+    for (k = 0; k < pp.N; k++) rc.zd[k] = ZSTD_createDCtx();
+    r = pipe_run(&pp);
+    for (k = 0; k < pp.N; k++) ZSTD_freeDCtx(rc.zd[k]);
+    pipe_free(&pp);
+    xfree(rc.zeros);
+    if (r != 0) die(pp.err);
     if (img_read(m, ftr, FTR_SIZE) != 0 || memcmp(ftr, "HDCEND", 6) != 0 ||
         le32(ftr + 44) != (u32)crc32(0, ftr, 44))
         die("rodape da imagem ausente ou corrompido (backup incompleto?)");
     if (le64(ftr + 32))
         printf("\n  Obs.: o disco original tinha %llu setores ilegiveis (gravados como zero).",
                (unsigned long long)le64(ftr + 32));
-    xfree(buf);
-    xfree(cbuf);
-    xfree(zeros);
 }
 
 #ifdef HDCLONE_GUI
@@ -3508,7 +3985,10 @@ static void usage(void)
         "  hdclone extract <img.hdc> N <caminho> <destino> copia arquivo/pasta da imagem\n\n"
         "<disco> = numero mostrado em 'list' (ex.: 1) ou caminho de arquivo/dispositivo.\n\n"
         "Opcoes de backup:\n"
-        "  -c N         nivel de compressao 1 (rapido) a 9 (menor). Padrao: 6\n"
+        "  -c N         nivel de compressao zstd: 1 (rapido) a 19 (menor). Padrao: 3\n"
+        "               (1 = rapida, 3 = normal, 9 = maxima)\n"
+        "  --compat     formato antigo (zlib, niveis 1 a 9), legivel por versoes\n"
+        "               anteriores do hdclone. Mais lento.\n"
         "  -s MB        dividir a imagem em partes de MB megabytes. Padrao: 4000\n"
         "               (cabe em pendrive FAT32). Use -s 0 para arquivo unico.\n"
         "  --raw        copia setor a setor, inclusive espaco livre\n"
@@ -3578,7 +4058,6 @@ int main(int argc, char **argv)
     char *pos[6];
     int np = 0, i;
     memset(&o, 0, sizeof(o));
-    o.level = 6;
     o.split = 4000ull * 1024 * 1024;
 #ifdef _WIN32
     {
@@ -3588,13 +4067,15 @@ int main(int argc, char **argv)
 #endif
 
     if (argc < 2) {
+        o.level = 3;
         interactive(&o);
         return 0;
     }
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             o.level = atoi(argv[++i]);
-            if (o.level < 1 || o.level > 9) die("nivel de compressao deve ser de 1 a 9");
+        } else if (!strcmp(argv[i], "--compat")) {
+            o.compat = 1;
         } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             const char *q = argv[++i];
             u64 v = 0;
@@ -3610,6 +4091,9 @@ int main(int argc, char **argv)
         else if (np < 6) pos[np++] = argv[i];
         else { usage(); return 1; }
     }
+    if (!o.level) o.level = o.compat ? 6 : 3;
+    if (o.compat ? (o.level < 1 || o.level > 9) : (o.level < 1 || o.level > 19))
+        die(o.compat ? "com --compat o nivel de compressao vai de 1 a 9" : "nivel de compressao deve ser de 1 a 19");
     if (np == 1 && !strcmp(pos[0], "list")) cmd_list();
     else if (np == 3 && !strcmp(pos[0], "backup")) cmd_backup(pos[1], pos[2], &o);
     else if (np == 3 && !strcmp(pos[0], "restore")) cmd_restore(pos[1], pos[2], &o);

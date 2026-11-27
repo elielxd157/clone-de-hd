@@ -10,7 +10,8 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - **Modo inteligente:** lê o bitmap do NTFS e a FAT do FAT32 e copia só os
   clusters em uso. O resto (outras partições, áreas desconhecidas) é copiado setor
   a setor, então qualquer sistema é preservado.
-- Compressão zlib em blocos de 1 MB com **CRC32 por bloco**.
+- Compressão **zstd** em blocos de 1 MB com **CRC32 por bloco**, usando todos os
+  núcleos do processador, com leitura, compressão e gravação acontecendo ao mesmo tempo.
 - Divide a imagem em partes de 4000 MB por padrão (cabe em pendrive FAT32).
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
 - **Recupera arquivos soltos** da imagem (sem restaurar o disco inteiro).
@@ -48,6 +49,27 @@ snapshots são temporários e apagados ao terminar (ou ao cancelar).
 - Se o VSS falhar, o backup continua sem ele e o motivo aparece no log. Na
   interface, a mensagem final avisa quando o disco do Windows foi copiado sem VSS.
 - Para desligar: desmarque "Usar VSS" ou use `--no-vss`.
+
+## Velocidade e compressão
+
+- **zstd** no lugar do zlib: no mesmo processador, comprime ~6–8× mais rápido e
+  descomprime ~4× mais rápido, com imagem do mesmo tamanho ou menor.
+- **Ler, comprimir e gravar ao mesmo tempo.** Mesmo num PC de 1 núcleo, o disco
+  lê o próximo bloco enquanto o processador comprime. Com HD lento, o backup
+  passa a andar na velocidade do disco.
+- **Usa todos os núcleos** (até 8) para comprimir.
+- **Gravação direta**: a imagem é gravada sem passar pelo cache do Windows, o que
+  evita que um XP com pouca memória fique lento ao gravar arquivos enormes.
+
+Níveis na interface: **Rápida** (zstd 1), **Normal** (zstd 3, padrão), **Máxima**
+(zstd 9) e **Compatível com versões antigas** (zlib 6).
+
+**Compatibilidade:** esta versão lê imagens de todas as versões anteriores. Imagens
+novas (zstd) **não abrem em versões antigas do hdclone**; a versão antiga mostra
+"versão de imagem não suportada". Se precisar restaurar com uma versão antiga
+(por exemplo, num pendrive de boot antigo), escolha **Compatível com versões
+antigas** ou use `--compat`. Nesse modo, blocos que não comprimem (fotos, vídeos,
+zip) são detectados rapidamente e gravados direto.
 
 ## Recuperar arquivos da imagem
 
@@ -132,7 +154,7 @@ hdclone info E:\backup\pc.hdc
 
 Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
-Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0` = arquivo
+Opções: `-c N` (compressão zstd 1–19, padrão 3), `--compat` (formato antigo zlib), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
 `--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--force`.
 
@@ -149,4 +171,5 @@ Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0
 ## Compilar
 
 Em Linux (Debian/Ubuntu): `apt install gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 libz-mingw-w64-dev`,
-depois `make` → os quatro `.exe`. `make linux` gera uma versão Linux (usada nos testes).
+depois `make` → os quatro `.exe`. O zstd vem embutido em `zstd/` (licença BSD,
+gerado como arquivo único e compilado **sem** `ZSTD_MULTITHREAD`, que exigiria Windows Vista+). `make linux` gera uma versão Linux (usada nos testes).
