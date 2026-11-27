@@ -39,6 +39,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <setjmp.h>
 #include <zlib.h>
 #include "../zstd/zstd.h"
 
@@ -129,6 +130,13 @@ static void log_text(const char *s)
 }
 
 /* toda a saida do programa passa por aqui: tela (ou janela) + arquivo de log */
+/* autoteste: g_quiet manda a saida das operacoes internas so para o arquivo;
+   g_log_lock impede que elas abram/fechem o log; g_die_jmp faz um erro voltar
+   para a etapa do autoteste em vez de encerrar o programa */
+static int g_quiet, g_log_lock;
+static jmp_buf *g_die_jmp;
+static char g_die_msg[600];
+
 static void hd_printf(const char *fmt, ...)
 {
     char b[4096];
@@ -137,6 +145,7 @@ static void hd_printf(const char *fmt, ...)
     vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
     log_text(b);
+    if (g_quiet) return;
 #ifdef HDCLONE_GUI
     ui_log("%s", b);
 #else
@@ -149,6 +158,7 @@ static void log_open(const char *path, const char *what, int append)
 {
     char t[64];
     struct tm *tm;
+    if (g_log_lock) return;
     g_log_t0 = time(NULL);
     g_logf = fopen(path, append ? "a" : "w");
     if (!g_logf) return;
@@ -164,7 +174,7 @@ static void log_close(const char *result)
     time_t now = time(NULL);
     struct tm *tm;
     long el = (long)(now - g_log_t0);
-    if (!g_logf) return;
+    if (!g_logf || g_log_lock) return;
     tm = localtime(&now);
     if (tm) strftime(t, sizeof(t), "%d/%m/%Y %H:%M:%S", tm); else strcpy(t, "?");
     fprintf(g_logf, "\n\nResultado: %s\nFim: %s (duracao %02ld:%02ld:%02ld)\n", result, t, el / 3600, (el / 60) % 60,
@@ -173,8 +183,17 @@ static void log_close(const char *result)
     g_logf = NULL;
 }
 
+static void cleanup_all(void);
 static void die(const char *msg)
 {
+    if (g_die_jmp) { /* autoteste: registra, libera tudo e volta para a etapa */
+        char b[700];
+        snprintf(g_die_msg, sizeof(g_die_msg), "%s", msg);
+        snprintf(b, sizeof(b), "      erro: %s\n", msg);
+        log_text(b);
+        cleanup_all();
+        longjmp(*g_die_jmp, 1);
+    }
     if (g_logf) {
         char b[700];
         snprintf(b, sizeof(b), "\nERRO: %s\n", msg);

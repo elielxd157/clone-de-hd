@@ -25,7 +25,6 @@ static void reset_areas(void)
     g_nareas = 0;
 }
 
-#ifdef HDCLONE_GUI
 /* libera tudo o que ficou aberto (usado quando uma operacao e abortada) */
 static void unlock_all(void);
 static void cleanup_all(void)
@@ -53,7 +52,6 @@ static void cleanup_all(void)
     }
     reset_areas();
 }
-#endif
 
 static int bm_get(const u8 *bm, u64 i) { return (bm[i >> 3] >> (i & 7)) & 1; }
 

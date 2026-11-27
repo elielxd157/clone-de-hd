@@ -21,7 +21,7 @@
 
 enum {
     ID_MODE_BACKUP = 100, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_KEEPSYS,
-    ID_MODE_CLONE, ID_TARGET, ID_VERIFY, ID_HWFIX, ID_SKIPRP,
+    ID_MODE_CLONE, ID_TARGET, ID_VERIFY, ID_HWFIX, ID_SKIPRP, ID_SELFTEST,
     ID_LBL_DISK, ID_REFRESH, ID_LIST,
     ID_LBL_IMG, ID_PATH, ID_BROWSE, ID_IMGINFO,
     ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE, ID_VSS,
@@ -37,6 +37,7 @@ enum {
 #define MODE_VERIFY 2
 #define MODE_EXPLORE 3
 #define MODE_CLONE 4
+#define MODE_SELFTEST 5 /* nao e um modo da tela: so o trabalho do botao Autoteste */
 
 typedef struct {
     int mode;
@@ -121,6 +122,7 @@ static DWORD WINAPI worker(LPVOID arg)
         if (j->mode == MODE_BACKUP) cmd_backup(j->disk, j->path, &j->o);
         else if (j->mode == MODE_RESTORE) cmd_restore(j->path, j->disk, &j->o);
         else if (j->mode == MODE_CLONE) cmd_clone(j->disk, j->path, &j->o);
+        else if (j->mode == MODE_SELFTEST) cmd_selftest();
         else if (j->mode == MODE_EXPLORE) {
             printf("Abrindo a imagem para recuperar arquivos...\n");
             open_virtual(j->path);
@@ -339,7 +341,8 @@ static void set_mode(int m)
 
 static void set_running(int r)
 {
-    int ids[] = {ID_MODE_BACKUP, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_MODE_CLONE, ID_PATH, ID_BROWSE, ID_START};
+    int ids[] = {ID_MODE_BACKUP, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_MODE_CLONE, ID_PATH, ID_BROWSE, ID_START,
+                 ID_SELFTEST};
     int i;
     g_running = r;
     for (i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) EnableWindow(GetDlgItem(g_hwnd, ids[i]), !r);
@@ -577,6 +580,31 @@ static void start(void)
     }
 }
 
+static void start_selftest(void)
+{
+    if (g_running) return;
+    if (MessageBoxW(g_hwnd,
+                    L"O autoteste confere se o hdclone funciona corretamente neste computador.\n\n"
+                    L"NENHUM disco é alterado: ele só LÊ os discos (e cria um snapshot VSS temporário), "
+                    L"e os testes de gravação usam arquivos temporários (~700 MB livres na pasta TEMP), "
+                    L"apagados no final.\n\nLeva de 1 a 3 minutos. Iniciar?",
+                    APP_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+    memset(&g_job, 0, sizeof(g_job));
+    g_job.mode = MODE_SELFTEST;
+    SetWindowTextW(g_log, L"");
+    SendMessageW(g_prog, PBM_SETPOS, 0, 0);
+    SetWindowTextW(g_status, L"Autoteste em andamento...");
+    g_cancel = 0;
+    set_running(1);
+    {
+        DWORD tid;
+        HANDLE th = CreateThread(NULL, 0, worker, &g_job, 0, &tid);
+        if (!th) { set_running(0); return; }
+        CloseHandle(th);
+    }
+}
+
 static void cancel(int ask)
 {
     if (!g_running) return;
@@ -616,7 +644,8 @@ static void create_controls(void)
     ctl(L"BUTTON", L"Recuperar arquivos", BS_AUTORADIOBUTTON, 466, 26, 158, 20, ID_MODE_EXPLORE);
     CheckDlgButton(g_hwnd, ID_MODE_BACKUP, BST_CHECKED);
 
-    ctl(L"STATIC", L"", SS_LEFT | WS_GROUP, 12, 66, 500, 18, ID_LBL_DISK);
+    ctl(L"STATIC", L"", SS_LEFT | WS_GROUP, 12, 66, 396, 18, ID_LBL_DISK);
+    ctl(L"BUTTON", L"Autoteste", BS_PUSHBUTTON | WS_TABSTOP, 412, 61, 100, 24, ID_SELFTEST);
     ctl(L"BUTTON", L"Atualizar lista", BS_PUSHBUTTON | WS_TABSTOP, 520, 61, 110, 24, ID_REFRESH);
     g_list = ctl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 10, 88, 620, 120, ID_LIST);
     SendMessageW(g_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
@@ -693,6 +722,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case ID_REFRESH: refresh_disks(); break;
         case ID_BROWSE: browse(); break;
         case ID_START: start(); break;
+        case ID_SELFTEST: start_selftest(); break;
         case ID_CANCEL: cancel(1); break;
         case ID_PATH:
             if (HIWORD(wp) == EN_CHANGE) update_imginfo();
@@ -732,6 +762,21 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         int ok = (int)wp;
         int mode = g_job.mode;
         set_running(0);
+        if (mode == MODE_SELFTEST) {
+            wchar_t t[1500], lp[700];
+            MultiByteToWideChar(CP_ACP, 0, g_st_logpath, -1, lp, 700);
+            SendMessageW(g_prog, PBM_SETPOS, 1000, 0);
+            SetWindowTextW(g_status, g_st.fail ? L"Autoteste: há falhas." : L"Autoteste concluído sem falhas.");
+            swprintf(t, 1500, L"Autoteste %ls\n\n%d ok,  %d falha(s),  %d pulado(s),  %d aviso(s)%ls\n\n"
+                              L"Os detalhes estão na janela e no relatório:\n%ls\n\n"
+                              L"Se houver falha ou aviso, envie esse relatório para análise.",
+                     g_cancel ? L"cancelado." : g_st.fail ? L"encontrou problemas." : L"concluído.", g_st.pass,
+                     g_st.fail, g_st.skip, g_st.warn,
+                     g_st_bitlocker ? L"\n\nATENÇÃO: o disco do Windows usa BitLocker (veja o relatório)." : L"", lp);
+            if (!g_close_after) msgbox(t, g_st.fail || g_st_bitlocker ? MB_ICONWARNING : MB_ICONINFORMATION);
+            if (g_close_after) DestroyWindow(h);
+            return 0;
+        }
         if (ok && mode == MODE_EXPLORE) {
             SendMessageW(g_prog, PBM_SETPOS, 1000, 0);
             SetWindowTextW(g_status, L"Imagem aberta.");

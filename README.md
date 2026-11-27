@@ -24,6 +24,28 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - Restaura em disco **maior** ou **menor** que o original (em disco menor, a última
   partição é reduzida automaticamente quando os dados cabem).
 
+## Autoteste (recomendado antes do primeiro uso)
+
+Clique em **Autoteste** na janela (ou `hdclone selftest`). Em 1–3 minutos ele confere
+se o hdclone funciona direito **neste** computador, **sem alterar nenhum disco**:
+
+1. versão do Windows, 32/64 bits, núcleos;
+2. lista os discos e lê o início e o fim do disco do Windows (só leitura);
+3. lê o mapa de espaço usado do **C:** e compara com o que o Windows informa;
+   detecta se o C: usa **BitLocker**;
+4. cria um **snapshot VSS** temporário, lê por ele e descarta. Com BitLocker, mostra se o
+   snapshot entrega os dados descriptografados (nesse caso a imagem ficaria sem
+   criptografia);
+5. a 7. num **disco virtual** (arquivo temporário com FAT32 gerado pelo próprio teste):
+   backup, verificação, restauração (inclusive em disco menor), recuperar arquivos, busca,
+   clone, setor a setor, formato compatível, backup interrompido e imagem corrompida,
+   tudo conferido byte a byte;
+8. velocidade de compressão.
+
+Precisa de ~700 MB livres na pasta TEMP; os arquivos são apagados no final. O
+relatório fica em `%TEMP%\hdclone-autoteste.log`. Se houver falha ou aviso, envie esse
+arquivo para análise.
+
 ## Arquivos — mantenha os quatro na mesma pasta
 
 | Arquivo | Para quê |

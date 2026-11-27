@@ -19,7 +19,8 @@ static void usage(void)
         "  hdclone ls      <img.hdc> [N [pasta]]           lista particoes / pastas da imagem\n"
         "  hdclone extract <img.hdc> N <caminho> <destino> copia arquivo/pasta da imagem\n"
         "  hdclone find    <img.hdc> N <nome> [pasta]      procura arquivos (aceita * e ?)\n"
-        "  hdclone hwfix   <disco>              prepara o Windows de um disco para outro PC\n\n"
+        "  hdclone hwfix   <disco>              prepara o Windows de um disco para outro PC\n"
+        "  hdclone selftest                     autoteste (nao altera nenhum disco)\n\n"
         "<disco> = numero mostrado em 'list' (ex.: 1) ou caminho de arquivo/dispositivo.\n\n"
         "Opcoes de backup:\n"
         "  -c N         nivel de compressao zstd: 1 (rapido) a 19 (menor). Padrao: 3\n"
@@ -152,6 +153,7 @@ int main(int argc, char **argv)
     else if (np >= 2 && np <= 4 && !strcmp(pos[0], "ls")) cmd_ls(pos[1], np > 2 ? pos[2] : NULL, np > 3 ? pos[3] : NULL);
     else if (np == 5 && !strcmp(pos[0], "extract")) cmd_extract(pos[1], pos[2], pos[3], pos[4]);
     else if (np == 2 && !strcmp(pos[0], "hwfix")) cmd_hwfix(pos[1], &o);
+    else if (np == 1 && !strcmp(pos[0], "selftest")) { cmd_selftest(); return g_st.fail ? 1 : 0; }
     else if (np == 3 && !strcmp(pos[0], "clone")) cmd_clone(pos[1], pos[2], &o);
     else if ((np == 4 || np == 5) && !strcmp(pos[0], "find")) cmd_find(pos[1], pos[2], pos[3], np == 5 ? pos[4] : NULL);
     else { usage(); return 1; }

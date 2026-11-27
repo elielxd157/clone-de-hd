@@ -82,6 +82,7 @@ typedef struct {
 } ImgSrc;
 
 static ImgSrc g_is;
+static int g_idx_used; /* ultima imagem aberta pelo indice */
 
 /* le o indice do fim da imagem; 0 = ok (s->ix preenchido) */
 static int imgsrc_try_index(ImgSrc *s, const char *path)
@@ -156,6 +157,7 @@ static void imgsrc_open(const char *path)
     g_t0 = g_tlast = now_ms();
     if (imgsrc_try_index(s, path) == 0) {
         printf("  (indice da imagem lido)\n");
+        g_idx_used = 1;
         i = s->h.nchunks;
     } else if (img_seek(&s->m, 1, HDR_SIZE) != 0) {
         die("nao foi possivel ler a imagem");

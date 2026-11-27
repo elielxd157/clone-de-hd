@@ -11,7 +11,7 @@ static void progress(u64 done, u64 total, int force)
     u64 t = now_ms(), el;
     double pct, speed;
     unsigned long eta;
-    if (!force && t - g_tlast < 500) return;
+    if (g_quiet || (!force && t - g_tlast < 500)) return;
     g_tlast = t;
     el = t - g_t0;
     if (!el) el = 1;
@@ -311,6 +311,7 @@ typedef struct {
 } Opts;
 
 static int g_vss_used; /* ultimo backup usou VSS */
+static int g_last_direct; /* ultimo backup gravou sem passar pelo cache */
 static u64 g_last_rfails;
 static void cmd_verify(const char *path);
 static int g_shrunk;   /* ultima restauracao reduziu uma particao */
@@ -916,6 +917,7 @@ static void cmd_backup(const char *src, const char *dst, Opts *o)
             if (!o->compat) bc.zc[k] = ZSTD_createCCtx();
             else bc.probe[k] = xalloc(compressBound(65536));
         }
+        g_last_direct = m.direct;
         printf("\nCopiando (%s nivel %d, %d thread%s de compressao%s)...\n", o->compat ? "zlib" : "zstd", o->level,
                pp.N, pp.N > 1 ? "s" : "", m.direct ? ", gravacao direta" : "");
         rc = pipe_run(&pp);
