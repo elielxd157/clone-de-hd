@@ -18,6 +18,7 @@
 #include "src/disco_menor.c"
 #include "src/explorar.c"
 #include "src/hwfix_restore.c"
+#include "src/nobackup.c"
 #include "src/clone.c"
 #include "src/selftest.c"
 #include "src/main.c"

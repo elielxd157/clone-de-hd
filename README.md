@@ -35,7 +35,8 @@ se o hdclone funciona direito **neste** computador, **sem alterar nenhum disco**
    detecta se o C: usa **BitLocker**;
 4. cria um **snapshot VSS** temporário, lê por ele e descarta. Com BitLocker, mostra se o
    snapshot entrega os dados descriptografados (nesse caso a imagem ficaria sem
-   criptografia);
+   criptografia). Pelo snapshot, mede também a lista **"não fazer backup"** do Windows
+   (veja abaixo), sem excluir nada;
 5. a 7. num **disco virtual** (arquivo temporário com FAT32 gerado pelo próprio teste):
    backup, verificação, restauração (inclusive em disco menor), recuperar arquivos, busca,
    clone, setor a setor, formato compatível, backup interrompido e imagem corrompida,
@@ -179,6 +180,10 @@ e o relatório lista cada alteração. Limites:
   Information) e `MEMORY.DMP`/minidumps entram na imagem como **zeros**. Os arquivos
   continuam existindo e o NTFS fica íntegro, mas **o sistema restaurado perde os pontos
   de restauração antigos**. No XP os pontos de restauração não são tocados.
+- **Lista "não fazer backup" do Windows** (`FilesNotToBackup` no registro: pastas
+  temporárias, caches, logs etc.): por enquanto o hdclone só **mede** quanto ela
+  economizaria (`hdclone nobackup 0` ou no autoteste), sem deixar nada de fora. Cada
+  item aparece com o tamanho e o número de arquivos.
 - **exFAT e ext2/3/4** (Linux): só o espaço usado é copiado. Antes, essas partições eram
   copiadas inteiras.
 
@@ -267,6 +272,7 @@ hdclone verify E:\backup\pc.hdc       confere a imagem (recomendado antes de res
 hdclone restore E:\backup\pc.hdc 2    imagem -> disco 2 (APAGA o disco 2)
 hdclone clone 1 2 --verify             disco 1 -> disco 2 direto (APAGA o disco 2)
 hdclone hwfix 2                        prepara o Windows do disco 2 para outro PC
+hdclone nobackup 0                     mede a lista "não fazer backup" do Windows (só leitura)
 hdclone info E:\backup\pc.hdc
 ```
 

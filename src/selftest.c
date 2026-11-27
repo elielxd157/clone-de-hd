@@ -559,6 +559,23 @@ static void st_vss(void)
         xfree(s);
         xfree(r);
     }
+    {   /* lista "nao fazer backup" do Windows, lida pelo snapshot (somente leitura) */
+        u64 off, tot;
+        int disk, n;
+        Dev d;
+        char spec[16], s1[32];
+        sprintf(spec, "%d", g_st_sysd);
+        if (st_c_offset(&off, &disk) != 0 || disk != g_st_sysd || g_st_bitlocker) {
+            st_res(2, "lista \"nao fazer backup\" do Windows (C: nao localizado ou com BitLocker)");
+        } else if (dev_open(&d, spec, 0) == 0) {
+            d.use_snap = 1;
+            n = nobackup_disk(&d, st_say, off, &tot);
+            dev_close(&d);
+            fmt_size(tot, s1);
+            if (n) st_res(0, "lista \"nao fazer backup\" do Windows medida: %s que poderiam ficar de fora", s1);
+            else st_res(2, "lista \"nao fazer backup\" do Windows nao encontrada no C:");
+        }
+    }
     vss_end(0);
     st_res(0, "VSS: snapshot descartado");
 }
