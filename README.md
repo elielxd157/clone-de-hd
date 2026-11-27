@@ -18,6 +18,8 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - **Recupera arquivos soltos** da imagem (NTFS e FAT32), com **busca por nome**.
 - **Prepara o Windows para outro hardware** (evita a tela azul 0x7B), do XP ao 11.
 - **Verificação ao terminar** e relatório **.log** salvo junto da imagem.
+- Copia só o espaço usado em **NTFS, FAT32, exFAT e ext2/3/4** (Linux).
+- **Continua um backup interrompido** e lida rápido com **setores defeituosos**.
 - Deixa de fora `pagefile.sys` e `hiberfil.sys` (o Windows recria): imagem bem menor.
 - Restaura em disco **maior** ou **menor** que o original (em disco menor, a última
   partição é reduzida automaticamente quando os dados cabem).
@@ -123,6 +125,41 @@ e o relatório lista cada alteração. Limites:
   continuam precisando ser instalados.
 - A ativação do Windows/Office pode pedir reativação num hardware diferente.
 
+## Robustez
+
+- **Setores defeituosos:** num HD com defeito cada leitura que falha pode levar vários
+  segundos. O hdclone isola as áreas ruins em pedaços de 64 KB e setores, com um limite
+  de tentativas por bloco, e pula rápido as zonas totalmente ilegíveis. Num teste com
+  uma zona ruim de 20 MB, foram **164 leituras com falha em vez de 40.981** (~8 min em
+  vez de ~34 h). Em troca, alguns setores bons nas bordas das áreas ruins podem não ser
+  lidos. Para tentar ler absolutamente tudo, setor por setor (muito mais lento):
+  `--rescue-all`.
+- **Continuar backup interrompido** (cabo USB solto, falta de energia): escolha o mesmo
+  arquivo de imagem; a interface oferece "continuar de onde parou" (ou use `--resume`).
+  Os blocos já gravados são aproveitados e os últimos são conferidos. **Não é permitido
+  continuar o backup do disco do Windows em uso**, porque os dados mudaram desde a
+  interrupção. Também só use se o disco de origem não foi usado nesse meio tempo.
+- **Espaço no destino:** antes de copiar, o hdclone compara os dados com o espaço livre.
+  Se claramente não cabe, para na hora. Com destino **FAT32**, divide a imagem em partes
+  de 4 GB automaticamente.
+- **Verificar antes de restaurar** (opção "Verificar" no modo Restaurar, ou `--verify`):
+  a imagem inteira é conferida **antes** de apagar o disco de destino. Sem isso, uma
+  imagem danificada no meio deixa o disco meio gravado.
+- **Índice no fim da imagem:** abrir uma imagem grande em "Recuperar arquivos" (ou
+  restaurar em disco menor) lê alguns KB em vez de percorrer a imagem toda. Num teste
+  de 8,4 GB, foram **44 leituras de disco em vez de 15.360**.
+
+## Imagem menor
+
+- `pagefile.sys`, `hiberfil.sys` e `swapfile.sys` ficam de fora (padrão).
+- **Pontos de restauração e despejos de memória** (opção, desligada por padrão; ou
+  `--skip-restore-points`): as cópias de sombra do Windows Vista+ (System Volume
+  Information) e `MEMORY.DMP`/minidumps entram na imagem como **zeros**. Os arquivos
+  continuam existindo e o NTFS fica íntegro, mas **o sistema restaurado perde os pontos
+  de restauração antigos**. No XP os pontos de restauração não são tocados.
+- **exFAT e ext2/3/4** (Linux): só o espaço usado é copiado. Antes, essas partições eram
+  copiadas inteiras.
+
 ## Recuperar arquivos da imagem
 
 Para pegar só alguns arquivos ou pastas (ex.: os Documentos de alguém) sem
@@ -215,7 +252,7 @@ Dar dois cliques no `hdclone.exe` abre um **menu interativo**.
 
 Opções: `-c N` (compressão zstd 1–19, padrão 3), `--compat` (formato antigo zlib), `-s MB` (tamanho das partes, `-s 0` = arquivo
 único), `--raw` (copia tudo, inclusive espaço livre), `-y` (sem confirmação),
-`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--verify`, `--hwfix`, `--force`.
+`--zero-free` (zera o espaço livre no destino), `--no-vss`, `--keep-sys`, `--verify`, `--hwfix`, `--resume`, `--skip-restore-points`, `--rescue-all`, `--force`.
 
 ## Importante
 
@@ -226,6 +263,18 @@ Opções: `-c N` (compressão zstd 1–19, padrão 3), `--compat` (formato antig
   ("Estender volume") ou `diskpart` para usar o espaço extra.
 - Windows XP clonado para hardware **diferente** pode dar tela azul
   (0x7B, driver de controladora SATA/IDE) — isso é do XP, não da imagem.
+
+## Código e testes
+
+- O código fica em `src/`, dividido por assunto (base, imagem, VSS, leitores de sistema
+  de arquivos, backup, restauração, clone, recuperar arquivos, preparar hardware). O
+  `hdclone.c` inclui os arquivos em ordem, numa única unidade de compilação.
+- `make test` roda a bateria de testes em `tests/`: backup e restauração, disco menor,
+  recuperar arquivos, preparar hardware, clone, setores defeituosos, retomada, ext4/exFAT
+  e o caminho da interface. Alguns testes precisam de root (FUSE e loop): `sudo make test`.
+- `.github/workflows/build.yml`: no GitHub, compila os quatro `.exe`, confere que nenhuma
+  função exclusiva do Vista+ entrou na versão do XP, roda os testes e disponibiliza os
+  executáveis para download.
 
 ## Compilar
 

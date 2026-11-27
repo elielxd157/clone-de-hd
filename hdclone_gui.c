@@ -21,7 +21,7 @@
 
 enum {
     ID_MODE_BACKUP = 100, ID_MODE_RESTORE, ID_MODE_VERIFY, ID_MODE_EXPLORE, ID_KEEPSYS,
-    ID_MODE_CLONE, ID_TARGET, ID_VERIFY, ID_HWFIX,
+    ID_MODE_CLONE, ID_TARGET, ID_VERIFY, ID_HWFIX, ID_SKIPRP,
     ID_LBL_DISK, ID_REFRESH, ID_LIST,
     ID_LBL_IMG, ID_PATH, ID_BROWSE, ID_IMGINFO,
     ID_GRP_OPT, ID_LBL_COMP, ID_COMP, ID_SPLIT, ID_RAW, ID_ZEROFREE, ID_VSS,
@@ -324,8 +324,11 @@ static void set_mode(int m)
     EnableWindow(GetDlgItem(g_hwnd, ID_ZEROFREE), rs || cl);
     EnableWindow(GetDlgItem(g_hwnd, ID_VSS), bk || cl);
     EnableWindow(GetDlgItem(g_hwnd, ID_KEEPSYS), bk || cl);
-    EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), bk || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), bk || cl || rs);
+    SetDlgItemTextW(g_hwnd, ID_VERIFY, rs ? L"Verificar a imagem antes de apagar o disco"
+                                          : L"Verificar ao terminar (lê tudo de volta)");
     EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), rs || cl);
+    EnableWindow(GetDlgItem(g_hwnd, ID_SKIPRP), bk || cl);
     SetDlgItemTextW(g_hwnd, ID_START, bk   ? L"Iniciar backup"
                                       : rs ? L"Iniciar restauração"
                                       : cl ? L"Iniciar clone"
@@ -352,6 +355,7 @@ static void set_running(int r)
         EnableWindow(GetDlgItem(g_hwnd, ID_KEEPSYS), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_VERIFY), FALSE);
         EnableWindow(GetDlgItem(g_hwnd, ID_HWFIX), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd, ID_SKIPRP), FALSE);
         EnableWindow(g_target, FALSE);
     } else {
         set_mode(g_mode);
@@ -382,6 +386,31 @@ static void browse(void)
         ok = GetOpenFileNameW(&of);
     }
     if (ok) SetWindowTextW(g_path, file);
+}
+
+/* backup interrompido? (cabecalho valido, mas sem indice nem rodape no fim) */
+static int image_incomplete(const char *path)
+{
+    Hdr h;
+    int k, last = 0;
+    i64 sz;
+    char nm[620];
+    HANDLE f;
+    u8 t[64];
+    DWORD r = 0;
+    LARGE_INTEGER li;
+    if (peek_header(path, &h) != 0) return 0;
+    for (k = 1; k < 1000 && part_size(path, k) >= 0; k++) last = k;
+    if (!last || (sz = part_size(path, last)) < 64) return 1;
+    part_name(path, last, nm);
+    f = CreateFileA(nm, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    li.QuadPart = sz - 64;
+    SetFilePointerEx(f, li, NULL, FILE_BEGIN);
+    ReadFile(f, t, 64, &r, NULL);
+    CloseHandle(f);
+    if (r == 64 && (!memcmp(t, "HDCIDX\0\1", 8) || !memcmp(t + 16, "HDCEND", 6))) return 0;
+    return 1;
 }
 
 static void start(void)
@@ -427,12 +456,21 @@ static void start(void)
         g_job.o.no_vss = IsDlgButtonChecked(g_hwnd, ID_VSS) != BST_CHECKED;
         g_job.o.keep_sys = IsDlgButtonChecked(g_hwnd, ID_KEEPSYS) != BST_CHECKED;
         g_job.o.verify = IsDlgButtonChecked(g_hwnd, ID_VERIFY) == BST_CHECKED;
+        g_job.o.skip_restore = IsDlgButtonChecked(g_hwnd, ID_SKIPRP) == BST_CHECKED;
         if (!strchr(g_job.path, '.') || strrchr(g_job.path, '.') < strrchr(g_job.path, '\\')) {
             strcat(g_job.path, ".hdc");
         }
         if (GetFileAttributesA(g_job.path) != INVALID_FILE_ATTRIBUTES) {
-            if (MessageBoxW(g_hwnd, L"O arquivo de imagem já existe. Deseja substituí-lo?", APP_TITLE,
-                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            if (image_incomplete(g_job.path) && !d->is_system) {
+                int a = MessageBoxW(g_hwnd,
+                                    L"Já existe um backup INCOMPLETO neste arquivo (foi interrompido).\n\n"
+                                    L"Sim: continuar de onde parou (use só se o disco de origem não foi usado "
+                                    L"desde a interrupção).\nNão: apagar e começar do zero.",
+                                    APP_TITLE, MB_YESNOCANCEL | MB_ICONQUESTION);
+                if (a == IDCANCEL) return;
+                g_job.o.resume = a == IDYES;
+            } else if (MessageBoxW(g_hwnd, L"O arquivo de imagem já existe. Deseja substituí-lo?", APP_TITLE,
+                                   MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
                 return;
         }
         g_job_sysdisk = d->is_system;
@@ -465,6 +503,7 @@ static void start(void)
         }
         g_job.o.zero_free = IsDlgButtonChecked(g_hwnd, ID_ZEROFREE) == BST_CHECKED;
         g_job.o.hwfix = IsDlgButtonChecked(g_hwnd, ID_HWFIX) == BST_CHECKED;
+        g_job.o.verify = IsDlgButtonChecked(g_hwnd, ID_VERIFY) == BST_CHECKED;
         swprintf(t, 1200,
                  L"ATENÇÃO: TODOS OS DADOS DO DISCO ABAIXO SERÃO APAGADOS!\n\n"
                  L"    Disco %d  -  %ls\n    %ls\n    Unidades: %ls\n\n"
@@ -496,6 +535,7 @@ static void start(void)
         g_job.o.verify = IsDlgButtonChecked(g_hwnd, ID_VERIFY) == BST_CHECKED;
         g_job.o.zero_free = IsDlgButtonChecked(g_hwnd, ID_ZEROFREE) == BST_CHECKED;
         g_job.o.hwfix = IsDlgButtonChecked(g_hwnd, ID_HWFIX) == BST_CHECKED;
+        g_job.o.skip_restore = IsDlgButtonChecked(g_hwnd, ID_SKIPRP) == BST_CHECKED;
         g_job_sysdisk = d->is_system;
         fmt_sizew(tg->size, tsz);
         MultiByteToWideChar(CP_ACP, 0, tg->model[0] ? tg->model : "(desconhecido)", -1, tmodel, 160);
@@ -595,7 +635,7 @@ static void create_controls(void)
     ShowWindow(g_target, SW_HIDE);
     g_imginfo = ctl(L"STATIC", L"", SS_LEFT, 12, 268, 618, 18, ID_IMGINFO);
 
-    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 124, ID_GRP_OPT);
+    ctl(L"BUTTON", L"Opções", BS_GROUPBOX, 10, 290, 620, 150, ID_GRP_OPT);
     ctl(L"STATIC", L"Compressão:", SS_LEFT, 24, 312, 80, 18, ID_LBL_COMP);
     g_comp = ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 104, 308, 180, 140, ID_COMP);
     SendMessageW(g_comp, CB_ADDSTRING, 0, (LPARAM)L"Rápida (arquivo maior)");
@@ -612,15 +652,17 @@ static void create_controls(void)
     ctl(L"BUTTON", L"Verificar ao terminar (lê tudo de volta)", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 362, 284, 20, ID_VERIFY);
     ctl(L"BUTTON", L"Deixar de fora pagefile.sys e hiberfil.sys", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 388, 300, 20, ID_KEEPSYS);
     ctl(L"BUTTON", L"Preparar p/ outro PC (evita tela azul 0x7B)", BS_AUTOCHECKBOX | WS_TABSTOP, 336, 388, 284, 20, ID_HWFIX);
+    ctl(L"BUTTON", L"Deixar de fora pontos de restauração e despejos de memória (MEMORY.DMP) - imagem menor",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 24, 414, 596, 20, ID_SKIPRP);
     CheckDlgButton(g_hwnd, ID_KEEPSYS, BST_CHECKED);
     CheckDlgButton(g_hwnd, ID_VSS, BST_CHECKED);
 
-    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 424, 160, 30, ID_START);
-    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 424, 100, 30, ID_CANCEL);
-    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 431, 338, 20, ID_STATUS);
-    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 462, 620, 20, ID_PROGRESS);
+    ctl(L"BUTTON", L"Iniciar backup", BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 450, 160, 30, ID_START);
+    ctl(L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP | WS_DISABLED, 180, 450, 100, 30, ID_CANCEL);
+    g_status = ctl(L"STATIC", L"Pronto.", SS_LEFT | SS_ENDELLIPSIS, 292, 457, 338, 20, ID_STATUS);
+    g_prog = ctl(PROGRESS_CLASSW, L"", PBS_SMOOTH, 10, 488, 620, 20, ID_PROGRESS);
     SendMessageW(g_prog, PBM_SETRANGE32, 0, 1000);
-    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 490, 620, 150, ID_LOG);
+    g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 516, 620, 150, ID_LOG);
     SendMessageW(g_log, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
 
     EnumChildWindows(g_hwnd, set_font_cb, (LPARAM)g_font);
@@ -1417,7 +1459,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpszClassName = L"hdcloneGui";
     RegisterClassW(&wc);
 
-    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(650);
+    r.left = 0; r.top = 0; r.right = S(640); r.bottom = S(676);
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     CreateWindowW(L"hdcloneGui", APP_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                   CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
