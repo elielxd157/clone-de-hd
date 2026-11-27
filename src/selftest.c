@@ -422,8 +422,14 @@ static void st_env(void)
     memset(&ov, 0, sizeof(ov));
     ov.dwOSVersionInfoSize = sizeof(ov);
     GetVersionExA(&ov);
-    st_res(0, "Windows %lu.%lu build %lu %s, programa de %d bits%s, %d nucleo(s)", ov.dwMajorVersion,
-           ov.dwMinorVersion, ov.dwBuildNumber, ov.szCSDVersion, (int)sizeof(void *) * 8,
+    {
+        DWORD M = ov.dwMajorVersion, m = ov.dwMinorVersion, b = ov.dwBuildNumber;
+        const char *nm = M == 5 && m == 0 ? "2000" : M == 5 && m == 1 ? "XP" : M == 5 ? "XP x64 / Server 2003"
+                         : M == 6 && m == 0 ? "Vista" : M == 6 && m == 1 ? "7" : M == 6 && m == 2 ? "8"
+                         : M == 6 ? "8.1" : M == 10 && b >= 22000 ? "11" : M == 10 ? "10" : "?";
+        st_res(0, "Windows %s (%lu.%lu build %lu) %s", nm, M, m, b, ov.szCSDVersion);
+    }
+    st_res(0, "programa de %d bits%s, %d nucleo(s)", (int)sizeof(void *) * 8,
            is_wow64() ? " (em Windows 64 bits: o VSS nao funciona neste executavel)" : "", cores);
 #else
     st_res(0, "Linux, programa de %d bits, %d nucleo(s)", (int)sizeof(void *) * 8, cores);
@@ -545,7 +551,10 @@ static void st_vss(void)
             st_res(3, "volume %s: com BitLocker, o snapshot entrega os dados DESCRIPTOGRAFADOS. A imagem "
                       "ficaria sem criptografia (risco confirmado neste PC).", g_snap[i].label);
         } else {
-            ST_CHECK(!memcmp(s + 3, "NTFS    ", 8), "VSS: leitura pelo snapshot do volume %s", g_snap[i].label);
+            /* sem BitLocker, o 1o setor visto pelo snapshot e igual ao do disco */
+            const char *fs = !memcmp(s + 3, "NTFS    ", 8) ? "NTFS" : !memcmp(s + 82, "FAT32   ", 8) ? "FAT32"
+                             : !memcmp(s + 3, "EXFAT   ", 8) ? "exFAT" : "outro";
+            ST_CHECK(rawok && !memcmp(s, r, 512), "VSS: leitura pelo snapshot do volume %s (%s)", g_snap[i].label, fs);
         }
         xfree(s);
         xfree(r);
