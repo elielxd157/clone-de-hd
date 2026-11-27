@@ -31,7 +31,9 @@ se o hdclone funciona direito **neste** computador, **sem alterar nenhum disco**
 
 1. versão do Windows, 32/64 bits, núcleos;
 2. lista os discos e lê o início e o fim do disco do Windows (só leitura);
-3. lê o mapa de espaço usado do **C:** e compara com o que o Windows informa;
+3. lê o mapa de espaço usado do **C:** e compara com o que o Windows informa (no
+   Windows 10/11 o hdclone costuma achar 1–2 GB a menos: é o "armazenamento reservado"
+   ainda vazio, que o Windows conta como usado mas está livre no disco);
    detecta se o C: usa **BitLocker**;
 4. cria um **snapshot VSS** temporário, lê por ele e descarta. Com BitLocker, mostra se o
    snapshot entrega os dados descriptografados (nesse caso a imagem ficaria sem

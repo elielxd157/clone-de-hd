@@ -521,6 +521,10 @@ static void st_cmap(void)
     {
         u64 diff = used > wused ? used - wused : wused - used, tol = tot.QuadPart / 100 + 256ull * 1024 * 1024;
         ST_CHECK(diff <= tol, "espaco usado no C: lido pelo hdclone = %s; segundo o Windows = %s", s1, s2);
+        if (used < wused && diff > 256ull * 1024 * 1024)
+            st_say("             a diferenca costuma ser o \"armazenamento reservado\" do Windows 10/11: a parte\n"
+                   "             reservada ainda vazia conta como usada para o Windows, mas e espaco livre no\n"
+                   "             disco e nao precisa entrar na imagem (veja: fsutil storagereserve query C:)\n");
     }
 }
 
