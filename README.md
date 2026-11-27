@@ -13,7 +13,8 @@ partições, MBR/GPT, setor de boot) em um arquivo de imagem compactado `.hdc` e
 - Compressão zlib em blocos de 1 MB com **CRC32 por bloco**.
 - Divide a imagem em partes de 4000 MB por padrão (cabe em pendrive FAT32).
 - Setores defeituosos na origem são pulados (preenchidos com zero) e contados.
-- Restaurar num disco **maior** funciona (em GPT, a tabela é ajustada sozinha).
+- Restaura em disco **maior** ou **menor** que o original (em disco menor, a última
+  partição é reduzida automaticamente quando os dados cabem).
 
 ## Arquivos — mantenha os quatro na mesma pasta
 
@@ -45,6 +46,29 @@ snapshots são temporários e apagados ao terminar (ou ao cancelar).
 - Se o VSS falhar, o backup continua sem ele e o motivo aparece no log. Na
   interface, a mensagem final avisa quando o disco do Windows foi copiado sem VSS.
 - Para desligar: desmarque "Usar VSS" ou use `--no-vss`.
+
+## Restaurar em disco menor
+
+Exemplo: HD de 500 GB com 60 GB usados, restaurado num SSD de 120 GB.
+
+1. Antes de gravar qualquer coisa, o hdclone lê a tabela de partições e o mapa de
+   espaço usado de dentro da imagem e confere se tudo cabe.
+2. Se couber, restaura e **reduz a última partição** (NTFS ou FAT32), ajustando a
+   tabela de partições (MBR, partição lógica/estendida ou GPT).
+3. Se não couber, avisa o **tamanho mínimo de disco necessário** e não altera o
+   destino.
+
+Detalhes:
+- Os dados **não são movidos** dentro da partição. Só dá para reduzir até o último
+  cluster em uso. O Windows (principalmente o XP) costuma deixar arquivos de
+  sistema no meio do volume, então o mínimo pode ser maior que o espaço usado.
+  Se o mínimo ficar grande demais: no Windows de origem (Vista ou mais novo), use
+  *Gerenciamento de Disco > Diminuir volume*, que junta os dados no início, e
+  faça o backup de novo.
+- Só a **última** partição é reduzida; as anteriores precisam caber inteiras.
+- No NTFS, o volume é marcado para verificação: no primeiro boot o Windows roda o
+  chkdsk uma vez. É normal, deixe terminar.
+- NTFS com clusters defeituosos registrados não é reduzido (rode chkdsk e refaça o backup).
 
 ## Interface gráfica — `hdclone-gui.exe`
 
@@ -82,7 +106,6 @@ Opções: `-c 1..9` (compressão, padrão 6), `-s MB` (tamanho das partes, `-s 0
 - **Restaurar** o disco do Windows em uso não é possível (ninguém consegue
   sobrescrever o sistema que está rodando). Para isso, inicie por um pendrive
   WinPE / Hiren's BootCD PE e rode o hdclone dele, ou ligue o HD em outro PC.
-- O disco de destino precisa ser **do mesmo tamanho ou maior** que o original.
 - Depois de restaurar em disco maior, use o Gerenciamento de Disco
   ("Estender volume") ou `diskpart` para usar o espaço extra.
 - Windows XP clonado para hardware **diferente** pode dar tela azul

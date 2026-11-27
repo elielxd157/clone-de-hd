@@ -213,6 +213,7 @@ typedef struct {
     int fd;
 #endif
     int use_snap; /* leituras redirecionadas para os snapshots VSS */
+    void *src;    /* "disco virtual": leitura vem de dentro de uma imagem .hdc */
     int is_device;
     int disknum; /* Windows: numero do PhysicalDrive, -1 se arquivo */
     u64 size;
@@ -321,9 +322,12 @@ static int h_pread(fh_t h, void *buf, u32 len, u64 off)
 #endif
 }
 
+static int imgsrc_pread(void *src, void *buf, u32 len, u64 off);
+
 static int dev_pread(Dev *d, void *buf, u32 len, u64 off)
 {
     u8 *p = buf;
+    if (d->src) return imgsrc_pread(d->src, buf, len, off);
 #ifdef _WIN32
     if (!d->use_snap || !g_nsnap) return h_pread(d->h, buf, len, off);
 #else
@@ -396,6 +400,27 @@ static int dev_read_any(Dev *d, u64 off, u64 len, void *out)
     return rc;
 }
 
+/* grava qualquer faixa de bytes (le-modifica-grava setores parciais) */
+static int dev_write_any(Dev *d, u64 off, u64 len, const void *in)
+{
+    u32 ss = d->sector;
+    const u8 *src = in;
+    u8 *tmp = xalloc(CHUNK_SIZE + 2 * 65536);
+    int rc = 0;
+    while (len) {
+        u64 a = off - off % ss;
+        u64 skip = off - a;
+        u64 want = len < CHUNK_SIZE ? len : CHUNK_SIZE;
+        u64 span = ((skip + want + ss - 1) / ss) * ss;
+        if ((skip || (want % ss)) && dev_pread(d, tmp, (u32)span, a) != 0) { rc = -1; break; }
+        memcpy(tmp + skip, src, (size_t)want);
+        if (dev_pwrite(d, tmp, (u32)span, a) != 0) { rc = -1; break; }
+        src += want; off += want; len -= want;
+    }
+    xfree(tmp);
+    return rc;
+}
+
 /* ------------------------------------------------------------------ */
 /* arquivos de imagem (com divisao em partes)                          */
 /* ------------------------------------------------------------------ */
@@ -411,6 +436,8 @@ typedef struct {
     u64 cur;   /* bytes na parte atual */
     u64 limit; /* tamanho maximo de cada parte (0 = sem limite) */
     u64 total;
+    u64 pos;   /* leitura: posicao na parte atual */
+    u64 psize; /* leitura: tamanho da parte atual */
 } Img;
 
 static void part_name(const char *base, int part, char *out)
@@ -428,11 +455,19 @@ static int img_open_part(Img *m, int write)
                        write ? CREATE_ALWAYS : OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (m->h == INVALID_HANDLE_VALUE) return -1;
     res_add(RES_HANDLE, m->h);
+    m->pos = 0;
+    {
+        LARGE_INTEGER sz;
+        m->psize = GetFileSizeEx(m->h, &sz) ? (u64)sz.QuadPart : 0;
+    }
     return 0;
 #else
+    struct stat st;
     m->fd = open(nm, write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY, 0644);
     if (m->fd < 0) return -1;
     res_add(RES_HANDLE, (void *)(intptr_t)(m->fd + 1));
+    m->pos = 0;
+    m->psize = fstat(m->fd, &st) == 0 ? (u64)st.st_size : 0;
     return 0;
 #endif
 }
@@ -517,7 +552,40 @@ static int img_read(Img *m, void *buf, u64 n)
             if (img_open_part(m, 0) != 0) return -1;
             continue;
         }
-        p += r; n -= (u64)r; m->total += (u64)r;
+        p += r; n -= (u64)r; m->total += (u64)r; m->pos += (u64)r;
+    }
+    return 0;
+}
+
+/* posiciona a leitura em (parte, posicao) */
+static int img_seek(Img *m, int part, u64 pos)
+{
+    if (m->part != part) {
+        img_close_part(m);
+        m->part = part;
+        if (img_open_part(m, 0) != 0) return -1;
+    }
+#ifdef _WIN32
+    {
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)pos;
+        if (!SetFilePointerEx(m->h, li, NULL, FILE_BEGIN)) return -1;
+    }
+#else
+    if (lseek(m->fd, (off_t)pos, SEEK_SET) < 0) return -1;
+#endif
+    m->pos = pos;
+    return 0;
+}
+
+/* pula n bytes sem ler (atravessa partes) */
+static int img_skip(Img *m, u64 n)
+{
+    while (n) {
+        u64 rem = m->psize > m->pos ? m->psize - m->pos : 0;
+        if (n <= rem) return img_seek(m, m->part, m->pos + n);
+        n -= rem;
+        if (img_seek(m, m->part + 1, 0) != 0) return -1;
     }
     return 0;
 }
@@ -1112,143 +1180,248 @@ static u64 count_used(const u8 *bm, u64 n)
     return c;
 }
 
-static void map_ntfs(Dev *d, u64 off, u64 plen, const u8 *b)
+/* ---- NTFS ---- */
+
+typedef struct {
+    u32 bps, cs, recsz;
+    u64 tot_sec, ncl, mft_lcn, mirr_lcn;
+} NtfsGeo;
+
+typedef struct {
+    u64 len;  /* clusters */
+    i64 lcn;  /* -1 = esparso */
+} Run;
+
+static int ntfs_geo(const u8 *b, u64 plen, NtfsGeo *g)
 {
-    u32 bps = le16(b + 11), spc, recsz, usa_off, usa_cnt, a, i;
+    u32 spc;
     u8 spc_raw = b[13];
     signed char cpr = (signed char)b[0x40];
-    u64 cs, tot_sec, mft_lcn, ncl, bmbytes, pos = 0;
-    u8 *rec = NULL, *bm = NULL;
-    char s1[32], s2[32];
-
+    memset(g, 0, sizeof(*g));
+    g->bps = le16(b + 11);
     spc = spc_raw <= 0x80 ? spc_raw : (1u << (256 - spc_raw));
-    if (bps < 512 || bps > 4096 || (bps & (bps - 1)) || !spc) goto fail;
-    cs = (u64)bps * spc;
-    tot_sec = le64(b + 0x28);
-    mft_lcn = le64(b + 0x30);
-    recsz = cpr > 0 ? (u32)(cpr * cs) : (1u << (-cpr));
-    if (recsz < 256 || recsz > 65536) goto fail;
-    ncl = tot_sec * bps / cs;
-    if (ncl == 0 || ncl * cs > plen) goto fail;
-    bmbytes = (ncl + 7) / 8;
+    if (g->bps < 512 || g->bps > 4096 || (g->bps & (g->bps - 1)) || !spc) return -1;
+    g->cs = g->bps * spc;
+    g->tot_sec = le64(b + 0x28);
+    g->mft_lcn = le64(b + 0x30);
+    g->mirr_lcn = le64(b + 0x38);
+    g->recsz = cpr > 0 ? (u32)(cpr * g->cs) : (1u << (-cpr));
+    if (g->recsz < 256 || g->recsz > 65536) return -1;
+    g->ncl = g->tot_sec * g->bps / g->cs;
+    if (g->ncl == 0 || g->ncl * g->cs > plen || g->mft_lcn >= g->ncl) return -1;
+    return 0;
+}
 
-    /* registro 6 da MFT = $Bitmap */
-    rec = malloc(recsz);
-    if (!rec || dev_read_any(d, off + mft_lcn * cs + 6ull * recsz, recsz, rec) != 0) goto fail;
-    if (memcmp(rec, "FILE", 4) != 0) goto fail;
-    usa_off = le16(rec + 4);
-    usa_cnt = le16(rec + 6);
+/* desfaz a protecao "update sequence" de um registro da MFT */
+static int ntfs_fixup(u8 *rec, u32 recsz)
+{
+    u32 usa_off = le16(rec + 4), usa_cnt = le16(rec + 6), i;
+    if (memcmp(rec, "FILE", 4) != 0 || usa_off + 2 * usa_cnt > recsz) return -1;
     for (i = 1; i < usa_cnt; i++) {
         u32 p = i * 512 - 2;
-        if (p + 2 > recsz || usa_off + 2 * i + 1 >= recsz) break;
-        if (rec[p] != rec[usa_off] || rec[p + 1] != rec[usa_off + 1]) goto fail;
+        if (p + 2 > recsz) break;
+        if (rec[p] != rec[usa_off] || rec[p + 1] != rec[usa_off + 1]) return -1;
         rec[p] = rec[usa_off + 2 * i];
         rec[p + 1] = rec[usa_off + 2 * i + 1];
     }
-    a = le16(rec + 0x14);
+    return 0;
+}
+
+/* reaplica a protecao antes de gravar o registro */
+static void ntfs_protect(u8 *rec, u32 recsz)
+{
+    u32 usa_off = le16(rec + 4), usa_cnt = le16(rec + 6), i;
+    for (i = 1; i < usa_cnt; i++) {
+        u32 p = i * 512 - 2;
+        if (p + 2 > recsz) break;
+        rec[usa_off + 2 * i] = rec[p];
+        rec[usa_off + 2 * i + 1] = rec[p + 1];
+        rec[p] = rec[usa_off];
+        rec[p + 1] = rec[usa_off + 1];
+    }
+}
+
+static int ntfs_read_rec(Dev *d, u64 off, const NtfsGeo *g, u32 n, u8 *rec)
+{
+    if (dev_read_any(d, off + g->mft_lcn * g->cs + (u64)n * g->recsz, g->recsz, rec) != 0) return -1;
+    return ntfs_fixup(rec, g->recsz);
+}
+
+/* procura atributo; name = NULL para atributo sem nome. retorna offset ou -1 */
+static int ntfs_find_attr(const u8 *rec, u32 recsz, u32 type, const char *name)
+{
+    u32 a = le16(rec + 0x14);
     while (a + 16 <= recsz) {
-        u32 type = le32(rec + a), alen = le32(rec + a + 4);
-        if (type == 0xFFFFFFFF || alen < 16 || a + alen > recsz) { a = recsz; break; }
-        if (type == 0x80 && rec[a + 9] == 0) break; /* $DATA sem nome */
+        u32 t = le32(rec + a), alen = le32(rec + a + 4);
+        if (t == 0xFFFFFFFF || alen < 16 || a + alen > recsz) return -1;
+        if (t == type) {
+            u32 nl = rec[a + 9], no = le16(rec + a + 10), k;
+            if (!name && nl == 0) return (int)a;
+            if (name && nl == strlen(name) && a + no + 2 * nl <= recsz) {
+                for (k = 0; k < nl; k++)
+                    if (le16(rec + a + no + 2 * k) != (u8)name[k]) break;
+                if (k == nl) return (int)a;
+            }
+        }
         a += alen;
     }
-    if (a + 16 > recsz) goto fail;
+    return -1;
+}
 
+/* decodifica a runlist de um atributo nao residente */
+static int ntfs_runs(const u8 *rec, u32 a, Run *runs, int max)
+{
+    u32 alen = le32(rec + a + 4), p = a + le16(rec + a + 0x20);
+    i64 lcn = 0;
+    int n = 0;
+    while (p < a + alen && rec[p]) {
+        u8 h = rec[p++];
+        u32 ls = h & 15, os = h >> 4, k;
+        u64 rl = 0;
+        if (ls == 0 || ls > 8 || os > 8 || p + ls + os > a + alen || n >= max) return -1;
+        for (k = 0; k < ls; k++) rl |= (u64)rec[p + k] << (8 * k);
+        p += ls;
+        runs[n].len = rl;
+        if (os) {
+            u64 v = 0;
+            for (k = 0; k < os; k++) v |= (u64)rec[p + k] << (8 * k);
+            if (os < 8 && (rec[p + os - 1] & 0x80)) v |= ~0ull << (8 * os);
+            lcn += (i64)v;
+            p += os;
+            runs[n].lcn = lcn;
+        } else {
+            runs[n].lcn = -1;
+        }
+        n++;
+    }
+    return n;
+}
+
+#define MAX_RUNS 4096
+
+/* le o $Bitmap (clusters usados). Retorna NULL se nao conseguir. */
+static u8 *ntfs_load_bitmap(Dev *d, u64 off, const NtfsGeo *g)
+{
+    u8 *rec = malloc(g->recsz), *bm = NULL;
+    Run *runs = malloc(sizeof(Run) * MAX_RUNS);
+    u64 bmbytes = (g->ncl + 7) / 8, pos = 0;
+    int a, n, i;
+    if (!rec || !runs || ntfs_read_rec(d, off, g, 6, rec) != 0) goto fail;
+    a = ntfs_find_attr(rec, g->recsz, 0x80, NULL);
+    if (a < 0) goto fail;
     bm = calloc(1, (size_t)bmbytes + 8);
     if (!bm) goto fail;
     if (rec[a + 8] == 0) { /* residente */
         u32 vlen = le32(rec + a + 0x10), voff = le16(rec + a + 0x14);
-        if (a + voff + vlen > recsz) goto fail;
+        if (a + voff + vlen > g->recsz) goto fail;
         memcpy(bm, rec + a + voff, vlen < bmbytes ? vlen : (size_t)bmbytes);
         pos = vlen;
-    } else { /* nao residente: percorre a runlist */
-        u32 alen = le32(rec + a + 4);
-        u32 p = a + le16(rec + a + 0x20);
-        i64 lcn = 0;
-        while (p < a + alen && rec[p]) {
-            u8 h = rec[p++];
-            u32 ls = h & 15, os = h >> 4, k;
-            u64 rl = 0, bytes;
-            i64 delta = 0;
-            if (ls == 0 || ls > 8 || os > 8 || p + ls + os > a + alen) goto fail;
-            for (k = 0; k < ls; k++) rl |= (u64)rec[p + k] << (8 * k);
-            p += ls;
-            if (os) {
-                u64 v = 0;
-                for (k = 0; k < os; k++) v |= (u64)rec[p + k] << (8 * k);
-                if (os < 8 && (rec[p + os - 1] & 0x80)) v |= ~0ull << (8 * os);
-                delta = (i64)v;
-                p += os;
-            }
-            bytes = rl * cs;
-            if (os) {
-                lcn += delta;
-                if (pos < bmbytes) {
-                    u64 want = bytes < bmbytes - pos ? bytes : bmbytes - pos;
-                    if (dev_read_any(d, off + (u64)lcn * cs, want, bm + pos) != 0) goto fail;
-                }
+    } else {
+        n = ntfs_runs(rec, (u32)a, runs, MAX_RUNS);
+        if (n < 0) goto fail;
+        for (i = 0; i < n; i++) {
+            u64 bytes = runs[i].len * g->cs;
+            if (runs[i].lcn >= 0 && pos < bmbytes) {
+                u64 want = bytes < bmbytes - pos ? bytes : bmbytes - pos;
+                if (dev_read_any(d, off + (u64)runs[i].lcn * g->cs, want, bm + pos) != 0) goto fail;
             }
             pos += bytes;
         }
     }
     if (pos < bmbytes) goto fail;
-    /* verificacoes de sanidade: boot e MFT precisam estar marcados como usados */
-    if (!bm_get(bm, 0) || mft_lcn >= ncl || !bm_get(bm, mft_lcn)) goto fail;
-
-    fmt_size(ncl * cs, s1);
-    fmt_size(count_used(bm, ncl) * cs, s2);
-    printf("  NTFS em %llu MB: %s, usado %s (cluster %llu bytes)\n",
-           (unsigned long long)(off >> 20), s1, s2, (unsigned long long)cs);
-    add_area(off, cs, ncl, bm);
+    /* sanidade: boot e MFT precisam constar como usados */
+    if (!(bm[0] & 1) || !((bm[g->mft_lcn >> 3] >> (g->mft_lcn & 7)) & 1)) goto fail;
     free(rec);
-    return;
+    free(runs);
+    return bm;
 fail:
-    printf("  NTFS em %llu MB: nao foi possivel ler o bitmap, sera copiado inteiro\n",
-           (unsigned long long)(off >> 20));
     free(rec);
+    free(runs);
     free(bm);
+    return NULL;
 }
 
-static void map_fat32(Dev *d, u64 off, u64 plen, const u8 *b)
+static void map_ntfs(Dev *d, u64 off, u64 plen, const u8 *b)
 {
-    u32 bps = le16(b + 11), spc = b[13], rsv = le16(b + 14), nfats = b[16];
-    u32 tot = le16(b + 19) ? le16(b + 19) : le32(b + 32), fatsz = le32(b + 36), root = le32(b + 44);
-    u64 data_sec, ncl, cs, i, done = 0;
-    u8 *bm = NULL, *buf = NULL;
+    NtfsGeo g;
+    u8 *bm;
     char s1[32], s2[32];
+    if (ntfs_geo(b, plen, &g) != 0 || !(bm = ntfs_load_bitmap(d, off, &g))) {
+        printf("  NTFS em %llu MB: nao foi possivel ler o bitmap, sera copiado inteiro\n",
+               (unsigned long long)(off >> 20));
+        return;
+    }
+    fmt_size(g.ncl * g.cs, s1);
+    fmt_size(count_used(bm, g.ncl) * g.cs, s2);
+    printf("  NTFS em %llu MB: %s, usado %s (cluster %u bytes)\n",
+           (unsigned long long)(off >> 20), s1, s2, g.cs);
+    add_area(off, g.cs, g.ncl, bm);
+}
 
-    if (bps < 512 || bps > 4096 || !spc || !nfats || !fatsz) goto fail;
-    data_sec = rsv + (u64)nfats * fatsz;
-    if (tot <= data_sec) goto fail;
-    ncl = (tot - data_sec) / spc;
-    cs = (u64)bps * spc;
-    if ((u64)tot * bps > plen || (ncl + 2) * 4 > (u64)fatsz * bps) goto fail;
-    bm = calloc(1, (size_t)(ncl + 7) / 8 + 8);
-    buf = malloc(CHUNK_SIZE);
+/* ---- FAT32 ---- */
+
+typedef struct {
+    u32 bps, spc, rsv, nfats, tot, fatsz, root;
+    u64 data_sec, ncl, cs;
+} FatGeo;
+
+static int fat_geo(const u8 *b, u64 plen, FatGeo *g)
+{
+    memset(g, 0, sizeof(*g));
+    g->bps = le16(b + 11);
+    g->spc = b[13];
+    g->rsv = le16(b + 14);
+    g->nfats = b[16];
+    g->tot = le16(b + 19) ? le16(b + 19) : le32(b + 32);
+    g->fatsz = le32(b + 36);
+    g->root = le32(b + 44);
+    if (g->bps < 512 || g->bps > 4096 || !g->spc || !g->nfats || !g->fatsz) return -1;
+    g->data_sec = g->rsv + (u64)g->nfats * g->fatsz;
+    if (g->tot <= g->data_sec) return -1;
+    g->ncl = (g->tot - g->data_sec) / g->spc;
+    g->cs = (u64)g->bps * g->spc;
+    if ((u64)g->tot * g->bps > plen || (g->ncl + 2) * 4 > (u64)g->fatsz * g->bps) return -1;
+    return 0;
+}
+
+/* le a FAT e monta o mapa de clusters usados (bit i = cluster i+2) */
+static u8 *fat_load_bitmap(Dev *d, u64 off, const FatGeo *g)
+{
+    u8 *bm = calloc(1, (size_t)(g->ncl + 7) / 8 + 8), *buf = malloc(CHUNK_SIZE);
+    u64 done = 0;
     if (!bm || !buf) goto fail;
-    /* entradas da FAT para os clusters 2..ncl+1 */
-    while (done < ncl) {
-        u64 n = ncl - done, k;
+    while (done < g->ncl) {
+        u64 n = g->ncl - done, k;
         if (n > CHUNK_SIZE / 4) n = CHUNK_SIZE / 4;
-        if (dev_read_any(d, off + (u64)rsv * bps + (done + 2) * 4, n * 4, buf) != 0) goto fail;
+        if (dev_read_any(d, off + (u64)g->rsv * g->bps + (done + 2) * 4, n * 4, buf) != 0) goto fail;
         for (k = 0; k < n; k++)
             if (le32(buf + k * 4) & 0x0FFFFFFF) bm[(done + k) >> 3] |= (u8)(1 << ((done + k) & 7));
         done += n;
     }
-    if (root < 2 || root - 2 >= ncl || !bm_get(bm, root - 2)) goto fail;
-    fmt_size(ncl * cs, s1);
-    i = count_used(bm, ncl);
-    fmt_size(i * cs, s2);
-    printf("  FAT32 em %llu MB: %s, usado %s (cluster %llu bytes)\n",
-           (unsigned long long)(off >> 20), s1, s2, (unsigned long long)cs);
-    add_area(off + data_sec * bps, cs, ncl, bm);
+    if (g->root < 2 || g->root - 2 >= g->ncl || !bm_get(bm, g->root - 2)) goto fail;
     free(buf);
-    return;
+    return bm;
 fail:
-    printf("  FAT32 em %llu MB: nao foi possivel ler a FAT, sera copiado inteiro\n",
-           (unsigned long long)(off >> 20));
     free(bm);
     free(buf);
+    return NULL;
+}
+
+static void map_fat32(Dev *d, u64 off, u64 plen, const u8 *b)
+{
+    FatGeo g;
+    u8 *bm;
+    char s1[32], s2[32];
+    if (fat_geo(b, plen, &g) != 0 || !(bm = fat_load_bitmap(d, off, &g))) {
+        printf("  FAT32 em %llu MB: nao foi possivel ler a FAT, sera copiado inteiro\n",
+               (unsigned long long)(off >> 20));
+        return;
+    }
+    fmt_size(g.ncl * g.cs, s1);
+    fmt_size(count_used(bm, g.ncl) * g.cs, s2);
+    printf("  FAT32 em %llu MB: %s, usado %s (cluster %llu bytes)\n",
+           (unsigned long long)(off >> 20), s1, s2, (unsigned long long)g.cs);
+    add_area(off + g.data_sec * g.bps, g.cs, g.ncl, bm);
 }
 
 static void probe_fs(Dev *d, u64 off, u64 len)
@@ -1406,6 +1579,7 @@ typedef struct {
 } Opts;
 
 static int g_vss_used; /* ultimo backup usou VSS */
+static int g_shrunk;   /* ultima restauracao reduziu uma particao */
 
 static void cmd_backup(const char *src, const char *dst, Opts *o)
 {
@@ -1615,7 +1789,8 @@ static void print_header(Hdr *h)
 /* VERIFY / RESTORE                                                    */
 /* ------------------------------------------------------------------ */
 
-/* corrige a GPT quando o disco de destino e maior que o original */
+/* reescreve a GPT para o tamanho do disco de destino (maior ou menor que o
+   original): cabecalho primario, entradas e copia de seguranca no fim do disco */
 static void fix_gpt(Dev *d)
 {
     u32 ss = d->sector, hsize, n, esz, esec, i;
@@ -1633,6 +1808,8 @@ static void fix_gpt(Dev *d)
     esec = (u32)(((u64)n * esz + ss - 1) / ss);
     e = xalloc((size_t)esec * ss);
     if (dev_pread(d, e, esec * ss, elba * ss) == 0) {
+        put32(h + 88, (u32)crc32(0, e, n * esz)); /* entradas podem ter sido alteradas */
+        if (dev_pwrite(d, e, esec * ss, elba * ss) != 0) printf("  AVISO: falha ao gravar entradas GPT\n");
         put64(h + 32, last);
         put64(h + 48, last - esec - 1);
         put32(h + 16, 0);
@@ -1663,8 +1840,549 @@ out:
     xfree(mbr);
 }
 
+/* ------------------------------------------------------------------ */
+/* imagem como "disco virtual" (acesso aleatorio)                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    u64 pos;      /* posicao dos dados na parte */
+    u32 stored, crc;
+    int part;
+    u8 type;
+} ChunkIdx;
+
+typedef struct {
+    Img m;
+    Hdr h;
+    ChunkIdx *ix;
+    u8 *cache, *cbuf;
+    i64 ci;
+} ImgSrc;
+
+static ImgSrc g_is;
+
+/* percorre a imagem lendo so os cabecalhos dos blocos e monta um indice */
+static void imgsrc_open(const char *path)
+{
+    ImgSrc *s = &g_is;
+    u64 i;
+    memset(s, 0, sizeof(*s));
+    if (img_open(&s->m, path, 0, 0) != 0) die("nao foi possivel abrir a imagem");
+    read_header(&s->m, &s->h);
+    s->ix = xalloc((size_t)s->h.nchunks * sizeof(ChunkIdx));
+    g_t0 = g_tlast = now_ms();
+    for (i = 0; i < s->h.nchunks; i++) {
+        u8 ch[9];
+        ChunkIdx *c = &s->ix[i];
+        if (g_cancel) die("Operacao cancelada pelo usuario.");
+        if (img_read(&s->m, ch, 9) != 0) die("imagem incompleta (falta alguma parte?)");
+        c->type = ch[0];
+        c->stored = le32(ch + 1);
+        c->crc = le32(ch + 5);
+        if (c->type > CH_FREE || c->stored > compressBound(CHUNK_SIZE)) die("imagem corrompida");
+        if (c->type == CH_DEFLATE || c->type == CH_RAW) {
+            c->part = s->m.part;
+            c->pos = s->m.pos;
+            if (img_skip(&s->m, c->stored) != 0) die("imagem incompleta (falta alguma parte?)");
+        }
+        progress((i + 1) * CHUNK_SIZE < s->h.size ? (i + 1) * CHUNK_SIZE : s->h.size, s->h.size,
+                 i + 1 == s->h.nchunks);
+    }
+    s->cache = xalloc(CHUNK_SIZE);
+    s->cbuf = xalloc(compressBound(CHUNK_SIZE));
+    s->ci = -1;
+}
+
+static void imgsrc_close(void)
+{
+    ImgSrc *s = &g_is;
+    img_close_part(&s->m);
+    xfree(s->ix);
+    xfree(s->cache);
+    xfree(s->cbuf);
+    memset(s, 0, sizeof(*s));
+}
+
+static int imgsrc_chunk(ImgSrc *s, u64 i)
+{
+    ChunkIdx *c = &s->ix[i];
+    u64 off = i * CHUNK_SIZE;
+    u32 len = (u32)((s->h.size - off) < CHUNK_SIZE ? (s->h.size - off) : CHUNK_SIZE);
+    if (s->ci == (i64)i) return 0;
+    s->ci = -1;
+    if (c->type == CH_ZERO || c->type == CH_FREE) {
+        memset(s->cache, 0, len);
+    } else {
+        if (img_seek(&s->m, c->part, c->pos) != 0) return -1;
+        if (c->type == CH_RAW) {
+            if (img_read(&s->m, s->cache, len) != 0) return -1;
+        } else {
+            uLongf ul = CHUNK_SIZE;
+            if (img_read(&s->m, s->cbuf, c->stored) != 0) return -1;
+            if (uncompress(s->cache, &ul, s->cbuf, c->stored) != Z_OK || ul != len) return -1;
+        }
+        if ((u32)crc32(0, s->cache, len) != c->crc) return -1;
+    }
+    s->ci = (i64)i;
+    return 0;
+}
+
+static int imgsrc_pread(void *src, void *buf, u32 len, u64 off)
+{
+    ImgSrc *s = src;
+    u8 *p = buf;
+    while (len) {
+        u64 i = off / CHUNK_SIZE;
+        u32 o = (u32)(off % CHUNK_SIZE), n = CHUNK_SIZE - o;
+        if (n > len) n = len;
+        if (off + n > s->h.size || imgsrc_chunk(s, i) != 0) return -1;
+        memcpy(p, s->cache + o, n);
+        p += n; off += n; len -= n;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* restauracao em disco menor: reducao da ultima particao              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    u64 start, len;
+    u8 type;
+    int idx;         /* entrada na tabela (MBR/EBR: 0..3; GPT: indice) */
+    u64 tbl_off;     /* MBR/EBR: posicao do setor da tabela */
+    int logical;     /* particao logica (dentro da estendida) */
+    u64 prev_ebr;    /* logica: EBR anterior (cuja entrada 1 aponta para esta), 0 = nenhuma */
+} PEnt;
+
+typedef struct {
+    int gpt;
+    int n;
+    PEnt p[128];
+    int ext_idx;     /* entrada da particao estendida no MBR, -1 se nao ha */
+    u64 ext_start, ext_len;
+    u64 gpt_elba;
+    u32 gpt_esz;
+} PTable;
+
+static int list_parts(Dev *d, PTable *t)
+{
+    u8 mbr[512];
+    u64 ss = d->sector;
+    int i;
+    memset(t, 0, sizeof(*t));
+    t->ext_idx = -1;
+    if (dev_read_any(d, 0, 512, mbr) != 0 || mbr[510] != 0x55 || mbr[511] != 0xAA) return -1;
+    for (i = 0; i < 4; i++)
+        if (mbr[446 + 16 * i + 4] == 0xEE) t->gpt = 1;
+    if (t->gpt) {
+        u8 *h = xalloc(ss), *e;
+        u32 n, k;
+        if (dev_read_any(d, ss, ss, h) != 0 || memcmp(h, "EFI PART", 8) != 0) { xfree(h); return -1; }
+        t->gpt_elba = le64(h + 72);
+        n = le32(h + 80);
+        t->gpt_esz = le32(h + 84);
+        xfree(h);
+        if (n > 1024 || t->gpt_esz < 128 || t->gpt_esz > 1024) return -1;
+        e = malloc((size_t)n * t->gpt_esz);
+        if (!e || dev_read_any(d, t->gpt_elba * ss, (u64)n * t->gpt_esz, e) != 0) { free(e); return -1; }
+        for (k = 0; k < n && t->n < 128; k++) {
+            u8 *p = e + (size_t)k * t->gpt_esz;
+            static const u8 zero[16];
+            u64 first = le64(p + 32), last = le64(p + 40);
+            if (memcmp(p, zero, 16) == 0 || last < first) continue;
+            t->p[t->n].start = first * ss;
+            t->p[t->n].len = (last - first + 1) * ss;
+            t->p[t->n].idx = (int)k;
+            t->n++;
+        }
+        free(e);
+        return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        u8 *e = mbr + 446 + 16 * i;
+        u8 ty = e[4];
+        u64 lba = le32(e + 8), cnt = le32(e + 12);
+        if (!ty || !cnt) continue;
+        if (is_ext(ty)) {
+            u64 cur = lba, prev = 0;
+            int guard = 0;
+            t->ext_idx = i;
+            t->ext_start = lba * ss;
+            t->ext_len = cnt * ss;
+            while (guard++ < 256 && t->n < 128) {
+                u8 ebr[512];
+                u8 *l0 = ebr + 446, *l1 = ebr + 462;
+                if (dev_read_any(d, cur * ss, 512, ebr) != 0 || ebr[510] != 0x55 || ebr[511] != 0xAA) break;
+                if (l0[4] && le32(l0 + 12)) {
+                    PEnt *pe = &t->p[t->n++];
+                    pe->start = (cur + le32(l0 + 8)) * ss;
+                    pe->len = (u64)le32(l0 + 12) * ss;
+                    pe->type = l0[4];
+                    pe->idx = 0;
+                    pe->tbl_off = cur * ss;
+                    pe->logical = 1;
+                    pe->prev_ebr = prev;
+                }
+                if (!is_ext(l1[4]) || !le32(l1 + 8)) break;
+                prev = cur * ss;
+                cur = lba + le32(l1 + 8);
+            }
+        } else if (t->n < 128) {
+            PEnt *pe = &t->p[t->n++];
+            pe->start = lba * ss;
+            pe->len = cnt * ss;
+            pe->type = ty;
+            pe->idx = i;
+            pe->tbl_off = 0;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    int active;      /* destino menor: precisa reduzir */
+    int has_part;    /* ha uma particao a reduzir */
+    int fs;          /* 1 = NTFS, 2 = FAT32 */
+    PEnt p;
+    u64 new_len;
+    u64 new_end;
+    int ext_shrink;
+    u64 ext_new_len;
+    PTable t;
+} Plan;
+
+static u64 round_up(u64 v, u64 a) { return (v + a - 1) / a * a; }
+
+#define MIB (1024ull * 1024ull)
+
+/* tamanho minimo que a particao pode ter (bytes); 0 = nao pode ser reduzida
+   (why recebe o motivo) */
+static u64 fs_min_len(Dev *img, PEnt *pe, int *fs, char *why)
+{
+    u8 b[512];
+    *fs = 0;
+    strcpy(why, "sistema de arquivos nao suportado para reducao (so NTFS e FAT32)");
+    if (dev_read_any(img, pe->start, 512, b) != 0 || b[510] != 0x55 || b[511] != 0xAA) return 0;
+    if (memcmp(b + 3, "NTFS    ", 8) == 0) {
+        NtfsGeo g;
+        u8 *bm, *rec;
+        u64 lu;
+        int a;
+        Run runs[64];
+        int n, i;
+        *fs = 1;
+        if (ntfs_geo(b, pe->len, &g) != 0 || !(bm = ntfs_load_bitmap(img, pe->start, &g))) {
+            strcpy(why, "nao foi possivel ler o NTFS da imagem");
+            return 0;
+        }
+        for (lu = g.ncl; lu > 0 && !bm_get(bm, lu - 1); lu--)
+            ;
+        free(bm);
+        /* $Bitmap precisa ser nao residente; $BadClus nao pode ter clusters defeituosos */
+        rec = malloc(g.recsz);
+        if (!rec || ntfs_read_rec(img, pe->start, &g, 6, rec) != 0 ||
+            (a = ntfs_find_attr(rec, g.recsz, 0x80, NULL)) < 0 || rec[a + 8] == 0) {
+            free(rec);
+            strcpy(why, "estrutura do NTFS nao suportada para reducao ($Bitmap)");
+            return 0;
+        }
+        if (ntfs_read_rec(img, pe->start, &g, 8, rec) != 0 ||
+            (a = ntfs_find_attr(rec, g.recsz, 0x80, "$Bad")) < 0 || rec[a + 8] == 0 ||
+            (n = ntfs_runs(rec, (u32)a, runs, 64)) < 0) {
+            free(rec);
+            strcpy(why, "estrutura do NTFS nao suportada para reducao ($BadClus)");
+            return 0;
+        }
+        for (i = 0; i < n; i++)
+            if (runs[i].lcn >= 0) {
+                free(rec);
+                strcpy(why, "o NTFS registra clusters defeituosos; rode chkdsk e faca o backup de novo");
+                return 0;
+            }
+        free(rec);
+        /* clusters usados + setor do boot de reserva no fim */
+        return round_up(lu * g.cs + g.bps, g.bps);
+    }
+    if (memcmp(b + 82, "FAT32   ", 8) == 0) {
+        FatGeo g;
+        u8 *bm;
+        u64 lu, need;
+        *fs = 2;
+        if (fat_geo(b, pe->len, &g) != 0 || !(bm = fat_load_bitmap(img, pe->start, &g))) {
+            strcpy(why, "nao foi possivel ler a FAT32 da imagem");
+            return 0;
+        }
+        for (lu = g.ncl; lu > 0 && !bm_get(bm, lu - 1); lu--)
+            ;
+        free(bm);
+        need = lu > 65525 ? lu : 65525; /* menos que isso deixaria de ser FAT32 */
+        return g.data_sec * g.bps + need * g.cs;
+    }
+    return 0;
+}
+
+/* analisa se a imagem cabe num disco de T bytes; morre com explicacao se nao */
+static void plan_shrink(Dev *img, u64 T, Plan *pl)
+{
+    u64 ss = img->sector, reserve, usable, need_disk = 0;
+    int i, cross = -1, ncross = 0, bad = 0;
+    char msg[700], why[200] = "", s1[32], s2[32];
+
+    memset(pl, 0, sizeof(*pl));
+    pl->active = 1;
+    if (list_parts(img, &pl->t) != 0)
+        die("a imagem nao tem tabela de particoes reconhecida; nao e possivel restaurar em disco menor");
+    reserve = pl->t.gpt ? 33 * ss : 0; /* GPT de reserva no fim do disco */
+    usable = T - reserve;
+    pl->new_end = usable - usable % MIB;
+
+    for (i = 0; i < pl->t.n; i++) {
+        PEnt *pe = &pl->t.p[i];
+        u64 minlen, req;
+        int fs;
+        char w[200];
+        if (pe->start + pe->len <= usable) continue;
+        ncross++;
+        minlen = fs_min_len(img, pe, &fs, w);
+        if (!minlen) {
+            bad = 1;
+            req = pe->start + pe->len + reserve;
+            snprintf(why, sizeof(why), "particao em %llu MB: %s", (unsigned long long)(pe->start >> 20), w);
+        } else {
+            req = round_up(pe->start + minlen, MIB) + reserve;
+        }
+        if (req > need_disk) need_disk = req;
+        cross = i;
+        pl->fs = fs;
+    }
+    need_disk = round_up(need_disk, MIB);
+
+    if (ncross == 0) { /* todas as particoes cabem; so a estendida (container) pode precisar ajuste */
+        if (pl->t.ext_idx >= 0 && pl->t.ext_start + pl->t.ext_len > usable) {
+            u64 maxend = pl->t.ext_start + MIB;
+            for (i = 0; i < pl->t.n; i++)
+                if (pl->t.p[i].logical && pl->t.p[i].start + pl->t.p[i].len > maxend)
+                    maxend = pl->t.p[i].start + pl->t.p[i].len;
+            pl->ext_shrink = 1;
+            pl->ext_new_len = (maxend > pl->new_end ? maxend : pl->new_end) - pl->t.ext_start;
+        }
+        printf("\nO disco de destino e menor, mas todas as particoes cabem nele.\n");
+        return;
+    }
+    if (ncross > 1 || bad || need_disk > T || pl->t.p[cross].start >= pl->new_end ||
+        pl->t.p[cross].start + MIB > pl->new_end) {
+        fmt_size(T, s1);
+        fmt_size(need_disk, s2);
+        if (bad)
+            snprintf(msg, sizeof(msg), "a imagem nao cabe no disco de destino (%s): %s", s1, why);
+        else if (ncross > 1)
+            snprintf(msg, sizeof(msg),
+                     "a imagem nao cabe no disco de destino (%s): mais de uma particao ficaria fora do disco. "
+                     "Disco minimo necessario: %s", s1, s2);
+        else
+            snprintf(msg, sizeof(msg),
+                     "os dados nao cabem no disco de destino (%s). Disco minimo necessario: %s. "
+                     "Dica: no Windows de origem, use 'Gerenciamento de Disco > Diminuir volume' e "
+                     "faca o backup de novo; isso junta os dados no inicio da particao.", s1, s2);
+        die(msg);
+    }
+
+    pl->has_part = 1;
+    pl->p = pl->t.p[cross];
+    pl->new_len = pl->new_end - pl->p.start;
+    if (pl->p.logical || (pl->t.ext_idx >= 0 && pl->t.ext_start + pl->t.ext_len > usable)) {
+        u64 maxend = pl->new_end;
+        for (i = 0; i < pl->t.n; i++)
+            if (pl->t.p[i].logical && i != cross && pl->t.p[i].start + pl->t.p[i].len > maxend)
+                maxend = pl->t.p[i].start + pl->t.p[i].len;
+        pl->ext_shrink = 1;
+        pl->ext_new_len = maxend - pl->t.ext_start;
+    }
+    fmt_size(pl->p.len, s1);
+    fmt_size(pl->new_len, s2);
+    printf("\nO disco de destino e menor que o original. Plano:\n");
+    printf("  Particao em %llu MB (%s) sera reduzida de %s para %s.\n",
+           (unsigned long long)(pl->p.start >> 20), pl->fs == 1 ? "NTFS" : "FAT32", s1, s2);
+    printf("  Todos os dados usados cabem; nenhum dado precisa ser movido.\n");
+}
+
+/* aplica a reducao do NTFS no disco de destino ja restaurado */
+static void ntfs_shrink(Dev *d, u64 off, u64 new_len)
+{
+    u8 *boot = xalloc(4096), *rec = NULL, *orig = NULL, *mir = NULL;
+    NtfsGeo g;
+    u64 new_tot, ncl_new, bm_size, i;
+    int a, nr, k;
+    Run runs[64];
+    static const u32 recs[3] = {6, 8, 3};
+
+    if (dev_read_any(d, off, 512, boot) != 0 || ntfs_geo(boot, ~0ull, &g) != 0) die("falha ao ler o NTFS restaurado");
+    if (g.bps > 512 && dev_read_any(d, off, g.bps, boot) != 0) die("falha ao ler o NTFS restaurado");
+    new_tot = new_len / g.bps - 1; /* ultimo setor fica para a copia do boot */
+    ncl_new = new_tot * g.bps / g.cs;
+    bm_size = round_up((ncl_new + 7) / 8, 8);
+    rec = xalloc(g.recsz);
+    orig = xalloc(g.recsz);
+    mir = xalloc(g.recsz);
+
+    for (k = 0; k < 3; k++) {
+        u32 n = recs[k];
+        if (ntfs_read_rec(d, off, &g, n, rec) != 0) die("falha ao ler a MFT restaurada");
+        memcpy(orig, rec, g.recsz);
+        if (n == 6) { /* $Bitmap: novo tamanho; bits alem do fim do volume = 1 */
+            Run br[1024];
+            int nb;
+            u64 pos = 0, bit;
+            a = ntfs_find_attr(rec, g.recsz, 0x80, NULL);
+            if (a < 0 || rec[a + 8] == 0) die("$Bitmap inesperado");
+            if (bm_size > le64(rec + a + 0x28)) die("$Bitmap inesperado (tamanho)");
+            put64(rec + a + 0x30, bm_size);
+            if (le64(rec + a + 0x38) > bm_size) put64(rec + a + 0x38, bm_size);
+            nb = ntfs_runs(rec, (u32)a, br, 1024);
+            if (nb < 0) die("$Bitmap inesperado (runlist)");
+            /* marca os bits [ncl_new, bm_size*8) como usados, como o formatador faz */
+            for (i = 0; i < (u64)nb; i++) {
+                u64 rbytes = br[i].len * g.cs;
+                u64 lo = ncl_new / 8, hi = bm_size; /* bytes afetados */
+                u64 s0 = pos > lo ? pos : lo, e0 = pos + rbytes < hi ? pos + rbytes : hi;
+                if (br[i].lcn >= 0 && s0 < e0) {
+                    u64 len = e0 - s0;
+                    u8 *tmp = malloc((size_t)len);
+                    if (!tmp || dev_read_any(d, off + (u64)br[i].lcn * g.cs + (s0 - pos), len, tmp) != 0)
+                        die("falha ao ler o $Bitmap restaurado");
+                    for (bit = s0 * 8; bit < e0 * 8; bit++)
+                        if (bit >= ncl_new) tmp[bit / 8 - s0] |= (u8)(1 << (bit & 7));
+                    if (dev_write_any(d, off + (u64)br[i].lcn * g.cs + (s0 - pos), len, tmp) != 0)
+                        die("falha ao gravar o $Bitmap");
+                    free(tmp);
+                }
+                pos += rbytes;
+            }
+        } else if (n == 8) { /* $BadClus:$Bad = uma faixa esparsa do tamanho do volume */
+            u32 alen, ro, p, L;
+            a = ntfs_find_attr(rec, g.recsz, 0x80, "$Bad");
+            if (a < 0 || rec[a + 8] == 0) die("$BadClus inesperado");
+            nr = ntfs_runs(rec, (u32)a, runs, 64);
+            if (nr < 0) die("$BadClus inesperado (runlist)");
+            alen = le32(rec + a + 4);
+            ro = le16(rec + a + 0x20);
+            for (L = 1; L < 8 && (ncl_new >> (8 * L)) != 0; L++)
+                ;
+            if (ncl_new >> (8 * L - 1) & 1) L++; /* evita bit de sinal */
+            if (ro + 1 + L + 1 > alen) die("$BadClus sem espaco para a runlist");
+            p = a + ro;
+            memset(rec + p, 0, alen - ro);
+            rec[p] = (u8)L; /* tamanho do offset 0 = esparso */
+            for (i = 0; i < L; i++) rec[p + 1 + i] = (u8)(ncl_new >> (8 * i));
+            put64(rec + a + 0x18, ncl_new - 1);       /* ultimo VCN */
+            put64(rec + a + 0x28, ncl_new * g.cs);    /* tamanho alocado */
+            put64(rec + a + 0x30, ncl_new * g.cs);    /* tamanho dos dados */
+            if (le64(rec + a + 0x38) > ncl_new * g.cs) put64(rec + a + 0x38, ncl_new * g.cs);
+        } else { /* $Volume: marca "sujo" para o Windows rodar chkdsk no proximo boot */
+            u32 vo;
+            a = ntfs_find_attr(rec, g.recsz, 0x70, NULL);
+            if (a < 0 || rec[a + 8] != 0) die("$Volume inesperado");
+            vo = a + le16(rec + a + 0x14);
+            rec[vo + 0x0A] |= 0x01;
+        }
+        ntfs_protect(rec, g.recsz);
+        ntfs_protect(orig, g.recsz);
+        if (dev_write_any(d, off + g.mft_lcn * g.cs + (u64)n * g.recsz, g.recsz, rec) != 0)
+            die("falha ao gravar a MFT");
+        /* atualiza o espelho ($MFTMirr) se ele contem este registro */
+        if (dev_read_any(d, off + g.mirr_lcn * g.cs + (u64)n * g.recsz, g.recsz, mir) == 0 &&
+            memcmp(mir, orig, g.recsz) == 0 &&
+            dev_write_any(d, off + g.mirr_lcn * g.cs + (u64)n * g.recsz, g.recsz, rec) != 0)
+            die("falha ao gravar o $MFTMirr");
+    }
+    /* setor de boot e sua copia no ultimo setor da particao */
+    put64(boot + 0x28, new_tot);
+    if (dev_write_any(d, off, g.bps, boot) != 0 || dev_write_any(d, off + new_tot * g.bps, g.bps, boot) != 0)
+        die("falha ao gravar o setor de boot do NTFS");
+    xfree(boot);
+    xfree(rec);
+    xfree(orig);
+    xfree(mir);
+    printf("  NTFS reduzido (o Windows vai rodar o chkdsk uma vez no primeiro boot).\n");
+}
+
+static void fat32_shrink(Dev *d, u64 off, u64 new_len)
+{
+    u8 *b = xalloc(4096), *fi = xalloc(4096);
+    FatGeo g;
+    u32 bk, fsi;
+    if (dev_read_any(d, off, 512, b) != 0 || fat_geo(b, ~0ull, &g) != 0) die("falha ao ler a FAT32 restaurada");
+    if (dev_read_any(d, off, g.bps, b) != 0) die("falha ao ler a FAT32 restaurada");
+    put32(b + 32, (u32)(new_len / g.bps));
+    b[19] = b[20] = 0;
+    bk = le16(b + 50);
+    fsi = le16(b + 48);
+    if (dev_write_any(d, off, g.bps, b) != 0) die("falha ao gravar o boot da FAT32");
+    if (bk && bk < g.rsv && dev_write_any(d, off + (u64)bk * g.bps, g.bps, b) != 0)
+        die("falha ao gravar a copia do boot da FAT32");
+    if (fsi && fsi < g.rsv && dev_read_any(d, off + (u64)fsi * g.bps, g.bps, fi) == 0 &&
+        le32(fi) == 0x41615252) {
+        put32(fi + 488, 0xFFFFFFFFu); /* espaco livre: "desconhecido" (o Windows recalcula) */
+        dev_write_any(d, off + (u64)fsi * g.bps, g.bps, fi);
+    }
+    xfree(b);
+    xfree(fi);
+    printf("  FAT32 reduzida.\n");
+}
+
+/* altera sistema de arquivos e tabela de particoes no destino ja restaurado */
+static void apply_shrink(Dev *d, Plan *pl)
+{
+    u64 ss = d->sector;
+    u8 sec[512];
+    if (pl->has_part) {
+        if (pl->fs == 1) ntfs_shrink(d, pl->p.start, pl->new_len);
+        else fat32_shrink(d, pl->p.start, pl->new_len);
+    }
+
+    if (!pl->has_part) {
+        /* nada a fazer na particao */
+    } else if (pl->t.gpt) {
+        u64 at = pl->t.gpt_elba * ss + (u64)pl->p.idx * pl->t.gpt_esz;
+        u8 e[128];
+        if (dev_read_any(d, at, 128, e) != 0) die("falha ao ler a GPT");
+        put64(e + 40, (pl->p.start + pl->new_len) / ss - 1);
+        if (dev_write_any(d, at, 128, e) != 0) die("falha ao gravar a GPT");
+        /* CRCs e copia de reserva: fix_gpt */
+    } else {
+        u8 *e;
+        if (dev_read_any(d, pl->p.tbl_off, 512, sec) != 0) die("falha ao ler a tabela de particoes");
+        e = sec + 446 + 16 * pl->p.idx;
+        put32(e + 12, (u32)(pl->new_len / ss));
+        e[5] = 0xFE; e[6] = 0xFF; e[7] = 0xFF; /* CHS final: "use LBA" */
+        if (dev_write_any(d, pl->p.tbl_off, 512, sec) != 0) die("falha ao gravar a tabela de particoes");
+    }
+    if (pl->has_part && !pl->t.gpt) {
+        u8 *e;
+        if (pl->p.logical && pl->p.prev_ebr) { /* EBR anterior descreve a extensao desta logica */
+            if (dev_read_any(d, pl->p.prev_ebr, 512, sec) != 0) die("falha ao ler EBR");
+            e = sec + 462;
+            put32(e + 12, (u32)((pl->p.start + pl->new_len - pl->p.tbl_off) / ss));
+            e[5] = 0xFE; e[6] = 0xFF; e[7] = 0xFF;
+            if (dev_write_any(d, pl->p.prev_ebr, 512, sec) != 0) die("falha ao gravar EBR");
+        }
+    }
+    if (pl->ext_shrink && !pl->t.gpt) {
+        u8 *e;
+        {
+            if (dev_read_any(d, 0, 512, sec) != 0) die("falha ao ler o MBR");
+            e = sec + 446 + 16 * pl->t.ext_idx;
+            put32(e + 12, (u32)(pl->ext_new_len / ss));
+            e[5] = 0xFE; e[6] = 0xFF; e[7] = 0xFF;
+            if (dev_write_any(d, 0, 512, sec) != 0) die("falha ao gravar o MBR");
+        }
+    }
+    printf("  Tabela de particoes ajustada.\n");
+}
+
 /* processa a imagem; se d != NULL grava no disco */
-static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m)
+static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m, u64 limit)
 {
     u8 ch[9], ftr[FTR_SIZE];
     u8 *buf = xalloc(CHUNK_SIZE), *cbuf = xalloc(compressBound(CHUNK_SIZE)), *zeros = xalloc(CHUNK_SIZE);
@@ -1714,7 +2432,7 @@ static void process_image(const char *path, Dev *d, Opts *o, Hdr *h, Img *m)
             sprintf(msg, "CRC invalido no bloco %llu (imagem corrompida)", (unsigned long long)i);
             die(msg);
         }
-        if (d && data && dev_pwrite(d, data, len, off) != 0) {
+        if (d && data && off < limit && dev_pwrite(d, data, off + len > limit ? (u32)(limit - off) : len, off) != 0) {
             sprintf(msg, "falha de escrita no disco de destino na posicao %llu MB", (unsigned long long)(off >> 20));
             die(msg);
         }
@@ -1756,7 +2474,7 @@ static void cmd_verify(const char *path)
     printf("\nVerificando %s\n", path);
     print_header(&h);
     printf("\n");
-    process_image(path, NULL, &o, &h, &m);
+    process_image(path, NULL, &o, &h, &m, 0);
     img_close_part(&m);
     printf("\n\nImagem OK: todos os blocos conferem (CRC32).\n");
 }
@@ -1766,6 +2484,8 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
     Img m;
     Hdr h;
     Dev d;
+    Plan *pl = NULL;
+    u64 T;
     char s1[32], s2[32], msg[800];
 
     if (img_open(&m, path, 0, 0) != 0) die("nao foi possivel abrir a imagem");
@@ -1780,11 +2500,25 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
     fmt_size(d.size, s2);
     printf("\nDestino: %s (%s)\n", d.name, s2);
 
+    /* tamanho efetivo do destino. Arquivo: cresce ate o tamanho original, a menos
+       que ja exista com tamanho menor (simula um disco menor) */
+    T = d.size;
+    if (!d.is_device && (d.size == 0 || d.size >= h.size)) T = h.size;
+    if (T < h.size) {
+        Dev v;
+        static Plan plan;
+        printf("\nDestino menor que o original (%s < %s). Analisando a imagem...\n", s2, s1);
+        imgsrc_open(path);
+        memset(&v, 0, sizeof(v));
+        v.src = &g_is;
+        v.size = h.size;
+        v.sector = h.sector;
+        v.disknum = -1;
+        plan_shrink(&v, T, &plan); /* aborta aqui (sem gravar nada) se nao couber */
+        imgsrc_close();
+        pl = &plan;
+    }
     if (d.is_device) {
-        if (d.size < h.size) {
-            sprintf(msg, "o disco de destino (%s) e menor que o disco original (%s)", s2, s1);
-            die(msg);
-        }
         if (d.sector != h.sector) {
             printf("\nAVISO: tamanho de setor diferente (origem %u, destino %u). As particoes\n"
                    "provavelmente NAO funcionarao no destino.\n", h.sector, d.sector);
@@ -1804,21 +2538,22 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
     }
 
     printf("\nRestaurando...\n");
-    process_image(path, &d, o, &h, &m);
+    process_image(path, &d, o, &h, &m, T);
     img_close_part(&m);
 
     if (!d.is_device) {
 #ifdef _WIN32
         LARGE_INTEGER li;
-        li.QuadPart = (LONGLONG)h.size;
-        if (d.size < h.size) { SetFilePointerEx(d.h, li, NULL, FILE_BEGIN); SetEndOfFile(d.h); }
+        li.QuadPart = (LONGLONG)T;
+        if (d.size < T) { SetFilePointerEx(d.h, li, NULL, FILE_BEGIN); SetEndOfFile(d.h); }
 #else
-        if (d.size < h.size && ftruncate(d.fd, (off_t)h.size) != 0) die("falha ao ajustar tamanho do arquivo");
+        if (d.size < T && ftruncate(d.fd, (off_t)T) != 0) die("falha ao ajustar tamanho do arquivo");
 #endif
-        d.size = d.size > h.size ? d.size : h.size;
+        d.size = d.size > T ? d.size : T;
     }
     printf("\n\nFinalizando...\n");
-    if (d.size > h.size) fix_gpt(&d);
+    if (pl) apply_shrink(&d, pl);
+    if (d.size != h.size) fix_gpt(&d);
 #ifdef _WIN32
     if (d.is_device) {
         DWORD br;
@@ -1829,6 +2564,10 @@ static void cmd_restore(const char *path, const char *dst, Opts *o)
     unlock_all();
     dev_close(&d);
     printf("Restauracao concluida!\n");
+    g_shrunk = pl && pl->has_part;
+    if (pl && pl->has_part)
+        printf("A particao foi reduzida para caber no disco. No primeiro boot o Windows pode\n"
+               "rodar uma verificacao de disco (chkdsk): deixe terminar, e normal.\n");
     if (d.size > h.size)
         printf("Obs.: o disco de destino e maior. O espaco extra ficou nao alocado; use o\n"
                "Gerenciamento de Disco (Estender volume) ou diskpart para aproveita-lo.\n");

@@ -401,19 +401,18 @@ static void start(void)
                    L"WinPE / Hiren's BootCD PE e execute o hdclone a partir dele.", MB_ICONERROR);
             return;
         }
-        if (d->size < h.size) {
-            swprintf(t, 1200, L"O disco de destino (%ls) é menor que o disco original da imagem (%ls).\n\n"
-                              L"Escolha um disco do mesmo tamanho ou maior.", sz, isz);
-            msgbox(t, MB_ICONERROR);
-            return;
-        }
         g_job.o.zero_free = IsDlgButtonChecked(g_hwnd, ID_ZEROFREE) == BST_CHECKED;
         swprintf(t, 1200,
                  L"ATENÇÃO: TODOS OS DADOS DO DISCO ABAIXO SERÃO APAGADOS!\n\n"
                  L"    Disco %d  -  %ls\n    %ls\n    Unidades: %ls\n\n"
-                 L"Ele será substituído pela imagem (disco original de %ls).\n"
+                 L"Ele será substituído pela imagem (disco original de %ls).\n%ls"
                  L"Esta operação não pode ser desfeita.\n\nTem certeza que deseja continuar?",
-                 d->num, sz, model, letters, isz);
+                 d->num, sz, model, letters, isz,
+                 d->size < h.size
+                     ? L"\nO disco de destino é MENOR que o original: a última partição será reduzida, "
+                       L"se os dados couberem. O hdclone confere isso antes de gravar; se não couber, "
+                       L"ele avisa o tamanho mínimo e o disco não é alterado.\n\n"
+                     : L"");
         if (MessageBoxW(g_hwnd, t, APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     }
 
@@ -584,7 +583,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                                            L"imagem\" para conferir o arquivo antes de precisar dele."
                                          : L"Backup concluído com sucesso!\n\nDica: use \"Verificar imagem\" "
                                            L"para conferir o arquivo antes de precisar dele.")
-                       : mode == MODE_RESTORE ? L"Restauração concluída com sucesso!"
+                       : mode == MODE_RESTORE
+                           ? (g_shrunk ? L"Restauração concluída com sucesso!\n\nA última partição foi reduzida "
+                                         L"para caber no disco. No primeiro boot o Windows pode fazer uma "
+                                         L"verificação de disco (chkdsk): deixe terminar, é normal."
+                                       : L"Restauração concluída com sucesso!")
                                               : L"Imagem verificada: está íntegra.",
                        MB_ICONINFORMATION);
         } else {
