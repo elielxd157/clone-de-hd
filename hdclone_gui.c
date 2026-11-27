@@ -665,6 +665,11 @@ static void create_controls(void)
     g_log = ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 10, 516, 620, 150, ID_LOG);
     SendMessageW(g_log, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
 
+    /* As molduras (group box) foram criadas antes do que fica dentro delas e por isso
+       estavam "por cima" na ordem das janelas; com WS_CLIPSIBLINGS, as opcoes cediam a
+       area para a moldura e nao apareciam. Manda as molduras para tras de tudo. */
+    SetWindowPos(GetDlgItem(g_hwnd, ID_GRP_MODE), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(g_hwnd, ID_GRP_OPT), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     EnumChildWindows(g_hwnd, set_font_cb, (LPARAM)g_font);
     SendMessageW(GetDlgItem(g_hwnd, ID_START), WM_SETFONT, (WPARAM)g_bold, TRUE);
     set_mode(MODE_BACKUP);
